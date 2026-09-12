@@ -68,7 +68,8 @@ def load_index(notes_dir: str):
     if os.path.isfile(index_file):
         try:
             with open(index_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                index = json.load(f)
+            return index if isinstance(index, dict) else {}
         except Exception:
             pass
     return {}
@@ -78,6 +79,117 @@ def save_index(notes_dir: str, index):
     index_file = os.path.join(notes_dir, ".index.json")
     with open(index_file, "w", encoding="utf-8") as f:
         json.dump(index, f, ensure_ascii=False, indent=2)
+
+
+_GROUP_NAME_RE = re.compile(r'^[\u4e00-\u9fa5a-zA-Z0-9_\- ]{1,20}$')
+
+
+def _validate_group_name(name: str):
+    if not isinstance(name, str):
+        return "组名必须为字符串"
+    if not name:
+        return "组名不能为空"
+    stripped = name.strip()
+    if not stripped:
+        return "组名不能为空"
+    if len(stripped) > 20:
+        return "组名长度不能超过 20 个字符"
+    if stripped.startswith("_"):
+        return "组名不能以 _ 开头"
+    if not _GROUP_NAME_RE.match(stripped):
+        return "组名只能包含中文、英文、数字、下划线、连字符和空格"
+    return None
+
+
+def _is_safe_group_file(filename):
+    return (
+        isinstance(filename, str)
+        and bool(filename)
+        and "/" not in filename
+        and "\\" not in filename
+        and ".." not in filename
+    )
+
+
+def _group_files(entry):
+    if not isinstance(entry, dict):
+        return []
+    raw_files = entry.get("files", [])
+    if not isinstance(raw_files, list):
+        return []
+    files = []
+    seen = set()
+    for filename in raw_files:
+        if not _is_safe_group_file(filename) or filename in seen:
+            continue
+        seen.add(filename)
+        files.append(filename)
+    return files
+
+
+def _safe_group_entry(entry: dict, key: str) -> dict:
+    if not isinstance(entry, dict) or not isinstance(key, str):
+        return None
+    suffix = key[len("_group_"):] if key.startswith("_group_") else ""
+    name = entry.get("name", suffix)
+    if not isinstance(name, str):
+        name = suffix
+    name = name.strip()
+    if not name or _validate_group_name(name):
+        return None
+    collapsed = entry.get("collapsed", False)
+    if not isinstance(collapsed, bool):
+        collapsed = False
+    return {
+        "name": name,
+        "files": _group_files(entry),
+        "collapsed": collapsed,
+        "created_at": entry.get("created_at", "") if isinstance(entry.get("created_at"), str) else "",
+        "updated_at": entry.get("updated_at", "") if isinstance(entry.get("updated_at"), str) else "",
+    }
+
+
+def _get_groups(index: dict):
+    if not isinstance(index, dict):
+        return {}
+    groups = {}
+    for key, entry in index.items():
+        if not isinstance(key, str) or not key.startswith("_group_"):
+            continue
+        safe = _safe_group_entry(entry, key)
+        if safe:
+            groups[key] = safe
+    return groups
+
+
+def _set_groups(index: dict, groups: dict):
+    for key in list(index.keys()):
+        if isinstance(key, str) and key.startswith("_group_"):
+            del index[key]
+    for key, group in groups.items():
+        index[key] = group
+
+
+def _find_group_for_file(index: dict, filename: str) -> str:
+    if not _is_safe_group_file(filename):
+        return ""
+    for key, entry in _get_groups(index).items():
+        if filename in entry["files"]:
+            return entry["name"]
+    return ""
+
+
+def _remove_file_from_all_groups(index: dict, filename: str):
+    if not isinstance(index, dict):
+        return
+    for key, entry in index.items():
+        if not isinstance(key, str) or not key.startswith("_group_") or not isinstance(entry, dict):
+            continue
+        files = _group_files(entry)
+        if filename in files:
+            files.remove(filename)
+            entry["files"] = files
+            entry["updated_at"] = datetime.now().isoformat()
 
 
 def load_sync_paths(notes_dir: str):
@@ -526,6 +638,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             qs = urllib.parse.parse_qs(parsed.query)
             filename = qs.get("file", [""])[0]
             self.send_detail(filename)
+        elif path == "/api/groups":
+            self.send_groups()
         else:
             self.send_error(404)
 
@@ -563,6 +677,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_reveal(data)
         elif path == "/api/open":
             self.send_open(data)
+        elif path == "/api/group/create":
+            self.send_group_create(data)
+        elif path == "/api/group/add":
+            self.send_group_add(data)
+        elif path == "/api/group/remove":
+            self.send_group_remove(data)
+        elif path == "/api/group/rename":
+            self.send_group_rename(data)
+        elif path == "/api/group/disband":
+            self.send_group_disband(data)
+        elif path == "/api/group/toggle":
+            self.send_group_toggle(data)
         else:
             self.send_error(404)
 
@@ -653,6 +779,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def send_list(self):
         notes_dir = get_notes_dir()
         notes = []
+        index = load_index(notes_dir)
         for f in os.listdir(notes_dir):
             if not f.endswith(".md") or f in EXCLUDE_FILES:
                 continue
@@ -661,6 +788,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 continue
             info = self._parse_note(notes_dir, f, path)
             if info:
+                info["group"] = _find_group_for_file(index, f)
                 notes.append(info)
         notes.sort(key=lambda x: x["date"], reverse=True)
         self.send_json(notes)
@@ -669,6 +797,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         notes_dir = get_notes_dir()
         term_lower = term.lower()
         results = []
+        index = load_index(notes_dir)
         for f in os.listdir(notes_dir):
             if not f.endswith(".md") or f in EXCLUDE_FILES:
                 continue
@@ -681,6 +810,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             haystack = f"{info['file']} {info['title']} {' '.join(info['tags'])} {info['excerpt']} {info['content']}".lower()
             if term_lower in haystack:
                 info["_highlight"] = True
+                info["group"] = _find_group_for_file(index, f)
                 results.append(info)
         results.sort(key=lambda x: x["date"], reverse=True)
         self.send_json(results)
@@ -926,6 +1056,273 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except Exception as e:
             self.send_json({"ok": False, "error": str(e)})
 
+    def send_groups(self):
+        notes_dir = get_notes_dir()
+        index = load_index(notes_dir)
+        groups = _get_groups(index)
+        result = []
+        for key, group in groups.items():
+            safe_files = []
+            for f in group.get("files", []):
+                if not isinstance(f, str):
+                    continue
+                f = f.strip()
+                if not f or "/" in f or "\\" in f or ".." in f:
+                    continue
+                full = os.path.join(notes_dir, f)
+                if os.path.isfile(full) or os.path.islink(full):
+                    safe_files.append(f)
+            result.append({
+                "name": group.get("name", ""),
+                "files": safe_files,
+                "collapsed": group.get("collapsed", False),
+                "count": len(safe_files),
+            })
+        result.sort(key=lambda x: x["name"])
+        self.send_json(result)
+
+    def send_group_create(self, data):
+        name = data.get("name", "")
+        if not isinstance(name, str):
+            self.send_json({"ok": False, "error": "组名必须为字符串"})
+            return
+        err = _validate_group_name(name)
+        if err:
+            self.send_json({"ok": False, "error": err})
+            return
+        stripped = name.strip()
+        notes_dir = get_notes_dir()
+        index = load_index(notes_dir)
+        groups = _get_groups(index)
+        for key, group in groups.items():
+            if group.get("name") == stripped:
+                self.send_json({"ok": False, "error": "组名已存在"})
+                return
+        key = f"_group_{stripped}"
+        index[key] = {
+            "name": stripped,
+            "files": [],
+            "collapsed": False,
+            "created_at": datetime.now().isoformat(),
+            "updated_at": datetime.now().isoformat(),
+        }
+        save_index(notes_dir, index)
+        self.send_json({"ok": True, "group": stripped})
+
+    def send_group_add(self, data):
+        group_name = data.get("group", "")
+        if not isinstance(group_name, str):
+            self.send_json({"ok": False, "error": "组名必须为字符串"})
+            return
+        filename = data.get("file", "")
+        if not isinstance(filename, str):
+            self.send_json({"ok": False, "error": "文件名必须为字符串"})
+            return
+        err = _validate_group_name(group_name)
+        if err:
+            self.send_json({"ok": False, "error": err})
+            return
+        group_name = group_name.strip()
+        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+            self.send_json({"ok": False, "error": "文件名不合法"})
+            return
+        notes_dir = get_notes_dir()
+        path = os.path.join(notes_dir, filename)
+        if not os.path.isfile(path) and not os.path.islink(path):
+            self.send_json({"ok": False, "error": "文件不存在"})
+            return
+        index = load_index(notes_dir)
+        groups = _get_groups(index)
+        target_key = None
+        for key, group in groups.items():
+            if group.get("name") == group_name:
+                target_key = key
+                break
+        if not target_key:
+            self.send_json({"ok": False, "error": "组不存在"})
+            return
+        for key, entry in index.items():
+            if isinstance(key, str) and key.startswith("_group_") and isinstance(entry, dict):
+                files = _group_files(entry)
+                if filename in files:
+                    files.remove(filename)
+                    entry["files"] = files
+                    entry["updated_at"] = datetime.now().isoformat()
+        entry = index[target_key]
+        if not isinstance(entry, dict):
+            self.send_json({"ok": False, "error": "组不存在"})
+            return
+        files = _group_files(entry)
+        if filename not in files:
+            files.append(filename)
+        entry["files"] = files
+        entry["updated_at"] = datetime.now().isoformat()
+        save_index(notes_dir, index)
+        self.send_json({"ok": True, "group": group_name})
+
+    def send_group_remove(self, data):
+        if "group" in data:
+            group_name = data["group"]
+            if not isinstance(group_name, str):
+                self.send_json({"ok": False, "error": "组名必须为字符串"})
+                return
+        else:
+            group_name = ""
+        filename = data.get("file", "")
+        if not isinstance(filename, str):
+            self.send_json({"ok": False, "error": "文件名必须为字符串"})
+            return
+        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+            self.send_json({"ok": False, "error": "文件名不合法"})
+            return
+        notes_dir = get_notes_dir()
+        index = load_index(notes_dir)
+        groups = _get_groups(index)
+        if group_name:
+            err = _validate_group_name(group_name)
+            if err:
+                self.send_json({"ok": False, "error": err})
+                return
+            group_name = group_name.strip()
+            target_key = None
+            for key, group in groups.items():
+                if group.get("name") == group_name:
+                    target_key = key
+                    break
+            if not target_key:
+                self.send_json({"ok": False, "error": "组不存在"})
+                return
+        else:
+            target_key = None
+            for key, group in groups.items():
+                if filename in group.get("files", []):
+                    target_key = key
+                    break
+            if not target_key:
+                self.send_json({"ok": False, "error": "文件不在任何分组中"})
+                return
+        files = _group_files(index[target_key])
+        if filename not in files:
+            self.send_json({"ok": False, "error": "文件不在该组内"})
+            return
+        files.remove(filename)
+        index[target_key]["files"] = files
+        index[target_key]["updated_at"] = datetime.now().isoformat()
+        save_index(notes_dir, index)
+        self.send_json({"ok": True})
+
+    def send_group_rename(self, data):
+        old_name = data.get("old_name", "")
+        new_name = data.get("new_name", "")
+        if not isinstance(old_name, str):
+            self.send_json({"ok": False, "error": "原组名必须为字符串"})
+            return
+        if not isinstance(new_name, str):
+            self.send_json({"ok": False, "error": "新组名必须为字符串"})
+            return
+        err = _validate_group_name(new_name)
+        if err:
+            self.send_json({"ok": False, "error": err})
+            return
+        if not old_name:
+            self.send_json({"ok": False, "error": "原组名不能为空"})
+            return
+        notes_dir = get_notes_dir()
+        stripped_old = old_name.strip()
+        if not stripped_old:
+            self.send_json({"ok": False, "error": "原组名不能为空"})
+            return
+        stripped_new = new_name.strip()
+        index = load_index(notes_dir)
+        old_key = None
+        new_key = f"_group_{stripped_new}"
+        for key, entry in index.items():
+            if not isinstance(key, str) or not key.startswith("_group_"):
+                continue
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name", key[len("_group_"):])
+            if isinstance(name, str) and name == stripped_old:
+                old_key = key
+                break
+        if not old_key:
+            self.send_json({"ok": False, "error": "组不存在"})
+            return
+        if new_key in index:
+            self.send_json({"ok": False, "error": "组名已存在"})
+            return
+        normalized = _safe_group_entry(index[old_key], old_key)
+        if normalized:
+            normalized["name"] = stripped_new
+            normalized["updated_at"] = datetime.now().isoformat()
+            index.pop(old_key)
+            index[new_key] = normalized
+        else:
+            self.send_json({"ok": False, "error": "组不存在"})
+            return
+        save_index(notes_dir, index)
+        self.send_json({"ok": True, "name": stripped_new})
+
+    def send_group_disband(self, data):
+        name = data.get("name", "")
+        if not isinstance(name, str):
+            self.send_json({"ok": False, "error": "组名必须为字符串"})
+            return
+        err = _validate_group_name(name)
+        if err:
+            self.send_json({"ok": False, "error": err})
+            return
+        name = name.strip()
+        notes_dir = get_notes_dir()
+        index = load_index(notes_dir)
+        key = None
+        for k, entry in index.items():
+            if not k.startswith("_group_") or not isinstance(entry, dict):
+                continue
+            if entry.get("name") == name:
+                key = k
+                break
+        if not key:
+            self.send_json({"ok": False, "error": "组不存在"})
+            return
+        del index[key]
+        save_index(notes_dir, index)
+        self.send_json({"ok": True})
+
+    def send_group_toggle(self, data):
+        name = data.get("name", "")
+        collapsed = data.get("collapsed")
+        if not isinstance(name, str):
+            self.send_json({"ok": False, "error": "组名必须为字符串"})
+            return
+        if collapsed is not None and not isinstance(collapsed, bool):
+            self.send_json({"ok": False, "error": "collapsed 必须为布尔值"})
+            return
+        err = _validate_group_name(name)
+        if err:
+            self.send_json({"ok": False, "error": err})
+            return
+        name = name.strip()
+        notes_dir = get_notes_dir()
+        index = load_index(notes_dir)
+        key = None
+        for k, entry in index.items():
+            if not k.startswith("_group_") or not isinstance(entry, dict):
+                continue
+            if entry.get("name") == name:
+                key = k
+                break
+        if not key:
+            self.send_json({"ok": False, "error": "组不存在"})
+            return
+        if collapsed is None:
+            index[key]["collapsed"] = not index[key].get("collapsed", False)
+        else:
+            index[key]["collapsed"] = collapsed
+        index[key]["updated_at"] = datetime.now().isoformat()
+        save_index(notes_dir, index)
+        self.send_json({"ok": True, "collapsed": index[key]["collapsed"]})
+
     def send_tags(self, data):
         filename = data.get("file", "")
         tags = data.get("tags", [])
@@ -988,9 +1385,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 "discover_path": real,
                 "updated_at": datetime.now().isoformat(),
             }
+            _remove_file_from_all_groups(index, filename)
             save_index(notes_dir, index)
             os.remove(path)
         else:
+            index = load_index(notes_dir)
+            _remove_file_from_all_groups(index, filename)
+            save_index(notes_dir, index)
             os.rename(path, trash_path)
         self.send_json({"ok": True, "trash": os.path.basename(trash_path)})
 
@@ -1111,6 +1512,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         note_key_new = f"_note_{new_name}"
         if note_key_old in index:
             index[note_key_new] = index.pop(note_key_old)
+        for key, entry in index.items():
+            if key.startswith("_group_") and isinstance(entry, dict):
+                files = entry.get("files", [])
+                if filename in files:
+                    files.remove(filename)
+                    files.append(new_name)
+                    entry["files"] = files
+                    entry["updated_at"] = datetime.now().isoformat()
         save_index(notes_dir, index)
 
         if update_h1:
@@ -1640,6 +2049,117 @@ HTML = """<!DOCTYPE html>
     .main { padding: 16px; }
     .reader { padding: 20px; }
   }
+  .group-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    background: #f5f5f7;
+    border-radius: 8px;
+    margin: 12px 0 6px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .group-header .group-arrow {
+    width: 16px;
+    text-align: center;
+    font-size: 12px;
+    color: #86868b;
+  }
+  .group-header .group-name {
+    flex: 1;
+    font-weight: 600;
+    font-size: 14px;
+    color: #1d1d1f;
+  }
+  .group-header .group-count {
+    font-size: 12px;
+    color: #86868b;
+    margin-right: 8px;
+  }
+  .group-header .group-actions {
+    display: flex;
+    gap: 4px;
+  }
+  .group-header .group-actions button {
+    padding: 2px 8px;
+    font-size: 12px;
+  }
+  .group-files {
+    margin-left: 24px;
+    border-left: 2px solid #e5e5e5;
+    padding-left: 8px;
+  }
+  .group-file {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    font-size: 14px;
+  }
+  .group-file .file-name {
+    flex: 1;
+    color: #1d1d1f;
+  }
+  .group-file .file-remove {
+    color: #ff3b30;
+    cursor: pointer;
+    font-size: 12px;
+    padding: 2px 6px;
+  }
+  .ungrouped-zone {
+    border: 2px dashed #d2d2d7;
+    border-radius: 8px;
+    padding: 12px;
+    margin: 12px 0;
+    text-align: center;
+    color: #86868b;
+    font-size: 13px;
+  }
+  .ungrouped-zone.drag-over {
+    border-color: #007aff;
+    background: #f0f8ff;
+  }
+  .note.dragging {
+    opacity: 0.5;
+  }
+  .group-header.drag-over {
+    border: 2px dashed #007aff;
+    background: #f0f8ff;
+  }
+  .group-header.drag-invalid {
+    border: 2px dashed #ff3b30;
+    background: #fff0f0;
+  }
+  .create-group-zone {
+    border: 2px dashed #d2d2d7;
+    border-radius: 8px;
+    padding: 16px;
+    margin: 12px 0;
+    text-align: center;
+    color: #86868b;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .create-group-zone.drag-over {
+    border-color: #007aff;
+    background: #f0f8ff;
+  }
+  .add-to-group-select {
+    max-height: 200px;
+    overflow-y: auto;
+    border: 1px solid #d2d2d7;
+    border-radius: 8px;
+    padding: 8px;
+  }
+  .add-to-group-select label {
+    display: block;
+    padding: 6px 8px;
+    cursor: pointer;
+  }
+  .add-to-group-select label:hover {
+    background: #f5f5f7;
+  }
 </style>
 </head>
 <body>
@@ -1679,10 +2199,12 @@ HTML = """<!DOCTYPE html>
       <button class="view-mode-btn active" data-view-mode="flat">平铺</button>
       <button class="view-mode-btn" data-view-mode="source">按来源</button>
       <button class="view-mode-btn" data-view-mode="tag">按标签</button>
+      <button class="view-mode-btn" data-view-mode="group">分组</button>
     </div>
     <div class="batch-bar" id="batch-bar">
       <span>已选 <strong id="selected-count">0</strong> 条</span>
       <button class="btn btn-primary" data-action="batchTag">批量改标签</button>
+      <button class="btn btn-primary" data-action="batchAddToGroup">加入分组</button>
       <button class="btn btn-danger" data-action="batchDelete">批量删除</button>
       <button class="btn" data-action="clearSelection">取消选择</button>
     </div>
@@ -1880,7 +2402,267 @@ HTML = """<!DOCTYPE html>
       document.querySelectorAll('.view-mode-btn').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.viewMode === mode);
       });
-      renderList(allNotes);
+      if (mode === 'group') {
+        loadGroups();
+      } else {
+        renderList(allNotes);
+      }
+    }
+
+    let groupsCache = [];
+    async function loadGroups() {
+      try {
+        const res = await fetch('/api/groups');
+        groupsCache = await res.json();
+        renderList(allNotes);
+      } catch (e) { console.error(e); }
+    }
+
+    function renderGroups(notes) {
+      const el = document.getElementById('note-list');
+      const empty = document.getElementById('empty');
+      const countEl = document.getElementById('note-count');
+      const q = (searchQuery || '').toLowerCase();
+      const tagFilter = activeTag;
+      let html = '';
+      let total = 0;
+      const noteMap = {};
+      notes.forEach(n => { noteMap[n.file] = n; });
+      const rendered = new Set();
+      for (const group of groupsCache) {
+        let files = group.files || [];
+        if (tagFilter) {
+          files = files.filter(f => {
+            const n = noteMap[f];
+            return n && n.tags && n.tags.includes(tagFilter);
+          });
+        }
+        if (q) {
+          files = files.filter(f => {
+            const n = noteMap[f];
+            if (!n) return false;
+            const text = `${n.title} ${n.tags.join(' ')} ${n.excerpt} ${n.content}`.toLowerCase();
+            return text.includes(q);
+          });
+        }
+        const validFiles = files.filter(f => noteMap[f]);
+        total += validFiles.length;
+        html += `<div class="group-header" data-group="${escapeHtml(group.name)}" draggable="true">
+          <span class="group-arrow">${group.collapsed ? '▸' : '▾'}</span>
+          <span class="group-name">${escapeHtml(group.name)}</span>
+          <span class="group-count">${validFiles.length}</span>
+          <div class="group-actions">
+            <button class="btn" data-action="renameGroup" data-group="${escapeHtml(group.name)}">重命名</button>
+            <button class="btn btn-danger" data-action="disbandGroup" data-group="${escapeHtml(group.name)}">解散</button>
+          </div>
+        </div>`;
+        if (!group.collapsed && validFiles.length) {
+          html += `<div class="group-files">`;
+          for (const f of validFiles) {
+            const n = noteMap[f];
+            html += `<div class="group-file" data-file="${escapeHtml(n.file)}" draggable="true">
+              <span class="file-name">${highlightText(n.title, searchQuery)}</span>
+              <button class="btn" data-action="removeFromGroup" data-group="${escapeHtml(group.name)}" data-file="${escapeHtml(n.file)}">移出</button>
+            </div>`;
+          }
+          html += `</div>`;
+        }
+        if (!group.collapsed && !validFiles.length && files.length) {
+          html += `<div class="group-files" style="color:#86868b;font-size:13px;">无匹配结果</div>`;
+        }
+        if (!group.collapsed && !files.length) {
+          html += `<div class="group-files" style="color:#86868b;font-size:13px;">空组，拖入文件或勾选添加</div>`;
+        }
+      }
+      html += `<div class="create-group-zone" data-action="createGroup">+ 新建分组</div>`;
+      html += `<div class="ungrouped-zone" data-action="ungroupedZone">未分组（拖入文件到此区域）</div>`;
+      const ungrouped = notes.filter(n => !n.group && (tagFilter ? n.tags && n.tags.includes(tagFilter) : true) && (q ? `${n.title} ${n.tags.join(' ')} ${n.excerpt} ${n.content}`.toLowerCase().includes(q) : true));
+      total += ungrouped.length;
+      if (ungrouped.length) {
+        html += `<div style="font-size:13px;font-weight:600;color:#86868b;margin:16px 0 8px;">未分组</div>`;
+        html += `<div class="group-files">`;
+        for (const n of ungrouped) {
+          html += `<div class="note ${selectedFiles.has(n.file) ? 'selected' : ''}" data-file="${escapeHtml(n.file)}" draggable="true">
+            <button class="note-star ${n.starred ? 'starred' : ''}" data-action="toggleStar" data-file="${escapeHtml(n.file)}">${n.starred ? '★' : '☆'}</button>
+            <div class="note-title">${highlightText(n.title, searchQuery)}</div>
+            <div class="note-meta"><span>${n.date} ${n.time}</span></div>
+            <div class="note-meta">${n.tags.map(t => `<span class="tag">${highlightText(t, searchQuery)}</span>`).join('')}</div>
+            <div class="note-actions">
+              <button class="btn" data-action="addToGroup" data-file="${escapeHtml(n.file)}">加入分组</button>
+            </div>
+          </div>`;
+        }
+        html += `</div>`;
+      }
+      countEl.textContent = `共 ${total} 条总结`;
+      if (!total && !groupsCache.length) { el.innerHTML = ''; empty.style.display = 'block'; return; }
+      empty.style.display = 'none';
+      el.innerHTML = html;
+      setupGroupDnD();
+    }
+
+    function setupGroupDnD() {
+      const el = document.getElementById('note-list');
+      let draggedFile = null;
+      el.querySelectorAll('.note[draggable="true"], .group-file[draggable="true"]').forEach(item => {
+        item.addEventListener('dragstart', e => {
+          draggedFile = item.dataset.file;
+          item.classList.add('dragging');
+          e.dataTransfer.setData('text/plain', draggedFile);
+          e.dataTransfer.effectAllowed = 'move';
+        });
+        item.addEventListener('dragend', () => {
+          item.classList.remove('dragging');
+          draggedFile = null;
+          el.querySelectorAll('.drag-over, .drag-invalid').forEach(x => {
+            x.classList.remove('drag-over', 'drag-invalid');
+          });
+        });
+      });
+      el.querySelectorAll('.group-header[draggable="true"]').forEach(header => {
+        header.addEventListener('dragover', e => {
+          e.preventDefault();
+          if (!draggedFile) return;
+          header.classList.add('drag-over');
+          header.classList.remove('drag-invalid');
+        });
+        header.addEventListener('dragleave', () => {
+          header.classList.remove('drag-over', 'drag-invalid');
+        });
+        header.addEventListener('drop', e => {
+          e.preventDefault();
+          header.classList.remove('drag-over', 'drag-invalid');
+          if (!draggedFile) return;
+          const groupName = header.dataset.group;
+          addToGroup(groupName, draggedFile);
+        });
+      });
+      const ungrouped = el.querySelector('.ungrouped-zone');
+      if (ungrouped) {
+        ungrouped.addEventListener('dragover', e => {
+          e.preventDefault();
+          if (!draggedFile) return;
+          ungrouped.classList.add('drag-over');
+        });
+        ungrouped.addEventListener('dragleave', () => {
+          ungrouped.classList.remove('drag-over');
+        });
+        ungrouped.addEventListener('drop', e => {
+          e.preventDefault();
+          ungrouped.classList.remove('drag-over');
+          if (!draggedFile) return;
+          removeFromGroup(draggedFile);
+        });
+      }
+      const createZone = el.querySelector('.create-group-zone');
+      if (createZone) {
+        createZone.addEventListener('dragover', e => {
+          e.preventDefault();
+          if (!draggedFile) return;
+          createZone.classList.add('drag-over');
+        });
+        createZone.addEventListener('dragleave', () => {
+          createZone.classList.remove('drag-over');
+        });
+        createZone.addEventListener('drop', e => {
+          e.preventDefault();
+          createZone.classList.remove('drag-over');
+          if (!draggedFile) return;
+          const name = prompt('新建分组名称：');
+          if (!name) return;
+          createGroup(name).then(() => {
+            addToGroup(name, draggedFile);
+          });
+        });
+      }
+    }
+
+    async function createGroup(name) {
+      const res = await fetch('/api/group/create', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name}),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        alert(data.error || '创建失败');
+        return null;
+      }
+      await loadGroups();
+      return data.group;
+    }
+
+    async function addToGroup(groupName, file) {
+      const res = await fetch('/api/group/add', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({group: groupName, file}),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        alert(data.error || '添加失败');
+        return;
+      }
+      await loadGroups();
+    }
+
+    async function removeFromGroup(file) {
+      const res = await fetch('/api/group/remove', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({file}),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        alert(data.error || '移出失败');
+        return;
+      }
+      await loadGroups();
+    }
+
+    async function renameGroup(oldName) {
+      const newName = prompt('新分组名称：', oldName);
+      if (!newName || newName === oldName) return;
+      const res = await fetch('/api/group/rename', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({old_name: oldName, new_name: newName}),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        alert(data.error || '重命名失败');
+        return;
+      }
+      await loadGroups();
+    }
+
+    async function disbandGroup(name) {
+      if (!confirm(`确定解散分组「${name}」？文件将回到未分组。`)) return;
+      const res = await fetch('/api/group/disband', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name}),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        alert(data.error || '解散失败');
+        return;
+      }
+      await loadGroups();
+    }
+
+    async function toggleGroup(name, collapsed) {
+      const res = await fetch('/api/group/toggle', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name, collapsed}),
+      });
+      const data = await res.json();
+      if (!data.ok) {
+        alert(data.error || '操作失败');
+        return;
+      }
+      await loadGroups();
     }
 
     function groupBySource(notes) {
@@ -1938,6 +2720,10 @@ HTML = """<!DOCTYPE html>
         renderGroupedNotes(groupByTag(notes));
         return;
       }
+      if (viewMode === 'group') {
+        renderGroups(notes);
+        return;
+      }
       const el = document.getElementById('note-list');
       const empty = document.getElementById('empty');
       const countEl = document.getElementById('note-count');
@@ -1971,6 +2757,7 @@ HTML = """<!DOCTYPE html>
             <button class="btn" data-action="renameNote" data-file="${escapeHtml(n.file)}" data-symlink="${n.is_symlink ? '1' : '0'}" data-source-label="${escapeHtml(n.source_label || '')}">重命名</button>
             <button class="btn" data-action="revealNote" data-file="${escapeHtml(n.file)}" title="在 Finder 中显示">📂</button>
             <button class="btn btn-danger" data-action="deleteNote" data-file="${escapeHtml(n.file)}">删除</button>
+            <button class="btn" data-action="addToGroup" data-file="${escapeHtml(n.file)}">加入分组</button>
           </div>
         </div>
       `).join('');
@@ -2255,6 +3042,31 @@ HTML = """<!DOCTYPE html>
         renderList(allNotes);
       });
     }
+    function batchAddToGroup() {
+      if (!selectedFiles.size) return;
+      const existing = groupsCache.map(g => g.name).join('、');
+      const name = prompt(`将 ${selectedFiles.size} 条总结加入分组（${existing ? '现有分组: ' + existing + '；' : ''}输入新名称可自动创建）：`);
+      if (!name) return;
+      (async () => {
+        const res = await fetch('/api/group/create', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name}),
+        });
+        const cdata = await res.json();
+        if (!cdata.ok && !(cdata.error || '').includes('已存在')) {
+          alert(cdata.error || '创建失败');
+          return;
+        }
+        for (const f of Array.from(selectedFiles)) {
+          await addToGroup(name, f);
+        }
+        selectedFiles.clear();
+        document.getElementById('selected-count').textContent = '0';
+        await loadList();
+        if (viewMode === 'group') await loadGroups(); else renderList(allNotes);
+      })();
+    }
     function batchDelete() {
       if (!selectedFiles.size) return;
       showModal('批量删除', `确定要删除选中的 ${selectedFiles.size} 条总结吗？`, [
@@ -2443,6 +3255,24 @@ HTML = """<!DOCTYPE html>
         else if (action === 'renameNote') showRenameModal(file, btn.dataset.symlink === '1', btn.dataset.sourceLabel || '');
         else if (action === 'revealNote') revealFile(btn.dataset.file);
         else if (action === 'deleteNote') deleteNote(file);
+        else if (action === 'renameGroup') renameGroup(btn.dataset.group);
+        else if (action === 'disbandGroup') disbandGroup(btn.dataset.group);
+        else if (action === 'removeFromGroup') removeFromGroup(btn.dataset.file);
+        else if (action === 'addToGroup') {
+          const groupName = prompt('请输入分组名称：');
+          if (groupName) addToGroup(groupName, btn.dataset.file);
+        }
+        else if (action === 'createGroup') {
+          const name = prompt('新建分组名称：');
+          if (name) createGroup(name);
+        }
+        return;
+      }
+      const groupHeader = e.target.closest('.group-header');
+      if (groupHeader && e.target.closest('.group-arrow')) {
+        const name = groupHeader.dataset.group;
+        const collapsed = groupHeader.querySelector('.group-arrow').textContent === '▾';
+        toggleGroup(name, !collapsed);
         return;
       }
       const note = e.target.closest('.note');
@@ -2497,6 +3327,7 @@ HTML = """<!DOCTYPE html>
       if (!btn) return;
       const action = btn.dataset.action;
       if (action === 'batchTag') batchTag();
+      else if (action === 'batchAddToGroup') batchAddToGroup();
       else if (action === 'batchDelete') batchDelete();
       else if (action === 'clearSelection') clearSelection();
     });

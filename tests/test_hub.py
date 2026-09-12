@@ -1315,5 +1315,1061 @@ class TestFileDetail(_HTTPServerFixture):
         self.assertNotIn("Access-Control-Allow-Origin", headers)
 
 
+class TestGroups(_HTTPServerFixture):
+    def test_group_create_success(self):
+        self._start_server()
+        payload = json.dumps({"name": "工作"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["group"], "工作")
+
+    def test_group_create_duplicate(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        payload = json.dumps({"name": "工作"}).encode("utf-8")
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        status, _, body = self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertIn("已存在", data["error"])
+
+    def test_group_create_invalid_name(self):
+        self._start_server()
+        for bad in ["", "   ", "_test", "a" * 21, "工作/测试"]:
+            payload = json.dumps({"name": bad}).encode("utf-8")
+            status, _, body = self._request(
+                "/api/group/create",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                },
+                data=payload,
+            )
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertFalse(data["ok"])
+
+    def test_group_add_file(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        payload = json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        _, _, groups_body = self._request("/api/groups")
+        groups = json.loads(groups_body)
+        self.assertEqual(len(groups), 1)
+        self.assertIn("a.md", groups[0]["files"])
+
+    def test_group_add_auto_remove_from_old_group(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        for g in ["旧组", "新组"]:
+            self._request(
+                "/api/group/create",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(json.dumps({"name": g}).encode("utf-8"))),
+                },
+                data=json.dumps({"name": g}).encode("utf-8"),
+            )
+        self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"group": "旧组", "file": "a.md"}).encode("utf-8"))),
+            },
+            data=json.dumps({"group": "旧组", "file": "a.md"}).encode("utf-8"),
+        )
+        payload = json.dumps({"group": "新组", "file": "a.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        _, _, groups_body = self._request("/api/groups")
+        groups = json.loads(groups_body)
+        new_group = next(g for g in groups if g["name"] == "新组")
+        self.assertIn("a.md", new_group["files"])
+        old_group = next(g for g in groups if g["name"] == "旧组")
+        self.assertNotIn("a.md", old_group["files"])
+
+    def test_group_add_idempotent(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        payload = json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8")
+        self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        status, _, _ = self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        _, _, groups_body = self._request("/api/groups")
+        groups = json.loads(groups_body)
+        self.assertEqual(groups[0]["count"], 1)
+
+    def test_group_remove_file(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8"))),
+            },
+            data=json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8"),
+        )
+        payload = json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/remove",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        _, _, list_body = self._request("/api/list")
+        notes = json.loads(list_body)
+        self.assertEqual(notes[0]["group"], "")
+
+    def test_empty_group_persists(self):
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "空组"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "空组"}).encode("utf-8"),
+        )
+        status, _, body = self._request("/api/groups")
+        self.assertEqual(status, 200)
+        groups = json.loads(body)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["name"], "空组")
+        self.assertEqual(groups[0]["count"], 0)
+
+    def test_group_remove_file_only_no_group(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        for path, obj in [
+            ("/api/group/create", {"name": "工作"}),
+            ("/api/group/add", {"group": "工作", "file": "a.md"}),
+        ]:
+            payload = json.dumps(obj).encode("utf-8")
+            self._request(
+                path,
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                },
+                data=payload,
+            )
+        payload = json.dumps({"file": "a.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/remove",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        _, _, groups_body = self._request("/api/groups")
+        groups = json.loads(groups_body)
+        self.assertEqual(groups[0]["files"], [])
+        payload = json.dumps({"file": "a.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/remove",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertIn("不在任何分组", data["error"])
+
+    def test_group_rename(self):
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "旧组"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "旧组"}).encode("utf-8"),
+        )
+        payload = json.dumps({"old_name": "旧组", "new_name": "新组"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["name"], "新组")
+        _, _, groups_body = self._request("/api/groups")
+        groups = json.loads(groups_body)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["name"], "新组")
+
+    def test_group_disband(self):
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        payload = json.dumps({"name": "工作"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/disband",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        _, _, groups_body = self._request("/api/groups")
+        groups = json.loads(groups_body)
+        self.assertEqual(len(groups), 0)
+
+    def test_group_toggle_collapsed(self):
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        payload = json.dumps({"name": "工作", "collapsed": True}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/toggle",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["collapsed"])
+
+    def test_group_list_returns_all(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        for name in ["A", "B"]:
+            self._request(
+                "/api/group/create",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(json.dumps({"name": name}).encode("utf-8"))),
+                },
+                data=json.dumps({"name": name}).encode("utf-8"),
+            )
+        status, _, body = self._request("/api/groups")
+        self.assertEqual(status, 200)
+        groups = json.loads(body)
+        self.assertEqual(len(groups), 2)
+
+    def test_group_with_search_filter(self):
+        with open(os.path.join(self.tmpdir, "alpha.md"), "w", encoding="utf-8") as f:
+            f.write("# Alpha\n\ntags: x\n\nbody")
+        with open(os.path.join(self.tmpdir, "beta.md"), "w", encoding="utf-8") as f:
+            f.write("# Beta\n\ntags: y\n\nbody")
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"group": "工作", "file": "alpha.md"}).encode("utf-8"))),
+            },
+            data=json.dumps({"group": "工作", "file": "alpha.md"}).encode("utf-8"),
+        )
+        status, _, body = self._request("/api/search?q=beta")
+        self.assertEqual(status, 200)
+        notes = json.loads(body)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["file"], "beta.md")
+        self.assertEqual(notes[0]["group"], "")
+
+    def test_group_survives_file_rename(self):
+        with open(os.path.join(self.tmpdir, "old.md"), "w", encoding="utf-8") as f:
+            f.write("# Old\n\nbody")
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"group": "工作", "file": "old.md"}).encode("utf-8"))),
+            },
+            data=json.dumps({"group": "工作", "file": "old.md"}).encode("utf-8"),
+        )
+        payload = json.dumps({"file": "old.md", "new_name": "new.md"}).encode("utf-8")
+        status, _, _ = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        _, _, groups_body = self._request("/api/groups")
+        groups = json.loads(groups_body)
+        self.assertEqual(len(groups), 1)
+        self.assertIn("new.md", groups[0]["files"])
+        self.assertNotIn("old.md", groups[0]["files"])
+
+    def test_group_survives_file_delete(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8"))),
+            },
+            data=json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8"),
+        )
+        payload = json.dumps({"file": "a.md"}).encode("utf-8")
+        status, _, _ = self._request(
+            "/api/delete",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        _, _, groups_body = self._request("/api/groups")
+        groups = json.loads(groups_body)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["files"], [])
+        self.assertEqual(groups[0]["count"], 0)
+
+    def test_group_malicious_host_rejected(self):
+        self._start_server()
+        payload = json.dumps({"name": "工作"}).encode("utf-8")
+        req = urllib.request.Request(self._url("/api/group/create"), data=payload, method="POST")
+        req.add_header("Host", "evil.com")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(payload)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.fail(f"Expected 403 but got {resp.status}")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 403)
+
+    def test_group_origin_rejected(self):
+        self._start_server()
+        payload = json.dumps({"name": "工作"}).encode("utf-8")
+        req = urllib.request.Request(self._url("/api/group/create"), data=payload, method="POST")
+        req.add_header("Host", f"localhost:{self.port}")
+        req.add_header("Origin", "http://evil.com")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(payload)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.fail(f"Expected 403 but got {resp.status}")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 403)
+
+    def test_group_no_cors_header(self):
+        self._start_server()
+        payload = json.dumps({"name": "工作"}).encode("utf-8")
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        _, headers, _ = self._request("/api/groups")
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_drag_out_semantics_group_field_clears(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8"))),
+            },
+            data=json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8"),
+        )
+        payload = json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/remove",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        _, _, list_body = self._request("/api/list")
+        notes = json.loads(list_body)
+        self.assertEqual(notes[0]["group"], "")
+
+    def test_list_has_group_field(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8"))),
+            },
+            data=json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8"),
+        )
+        status, _, body = self._request("/api/list")
+        self.assertEqual(status, 200)
+        notes = json.loads(body)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["group"], "工作")
+        self.assertNotIn("/Users/", body)
+
+    def test_search_has_group_field(self):
+        with open(os.path.join(self.tmpdir, "alpha.md"), "w", encoding="utf-8") as f:
+            f.write("# Alpha\n\ntags: x\n\nbody")
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"group": "工作", "file": "alpha.md"}).encode("utf-8"))),
+            },
+            data=json.dumps({"group": "工作", "file": "alpha.md"}).encode("utf-8"),
+        )
+        status, _, body = self._request("/api/search?q=alpha")
+        self.assertEqual(status, 200)
+        notes = json.loads(body)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["group"], "工作")
+
+    def test_group_create_non_string_name_soft_error(self):
+        self._start_server()
+        for bad in [None, [], {}]:
+            payload = json.dumps({"name": bad}).encode("utf-8")
+            status, _, body = self._request(
+                "/api/group/create",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                },
+                data=payload,
+            )
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertFalse(data["ok"])
+
+    def test_group_add_non_string_params_soft_error(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        for bad_group in [123, None, [], {}]:
+            payload = json.dumps({"group": bad_group, "file": "a.md"}).encode("utf-8")
+            status, _, body = self._request(
+                "/api/group/add",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                },
+                data=payload,
+            )
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertFalse(data["ok"])
+        for bad_file in [123, None, [], {}]:
+            payload = json.dumps({"group": "工作", "file": bad_file}).encode("utf-8")
+            status, _, body = self._request(
+                "/api/group/add",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                },
+                data=payload,
+            )
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertFalse(data["ok"])
+
+    def test_group_name_stripped(self):
+        self._start_server()
+        payload = json.dumps({"name": " 工作 "}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["group"], "工作")
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        payload = json.dumps({"group": " 工作 ", "file": "a.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        _, _, list_body = self._request("/api/list")
+        notes = json.loads(list_body)
+        self.assertEqual(notes[0]["group"], "工作")
+
+    def test_group_add_cleans_all_old_groups(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        for g in ["旧组1", "旧组2"]:
+            self._request(
+                "/api/group/create",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(json.dumps({"name": g}).encode("utf-8"))),
+                },
+                data=json.dumps({"name": g}).encode("utf-8"),
+            )
+        self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"group": "旧组1", "file": "a.md"}).encode("utf-8"))),
+            },
+            data=json.dumps({"group": "旧组1", "file": "a.md"}).encode("utf-8"),
+        )
+        self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"group": "旧组2", "file": "a.md"}).encode("utf-8"))),
+            },
+            data=json.dumps({"group": "旧组2", "file": "a.md"}).encode("utf-8"),
+        )
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "新组"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "新组"}).encode("utf-8"),
+        )
+        payload = json.dumps({"group": "新组", "file": "a.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/add",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        _, _, groups_body = self._request("/api/groups")
+        groups = json.loads(groups_body)
+        new_group = next(g for g in groups if g["name"] == "新组")
+        self.assertIn("a.md", new_group["files"])
+        for old_name in ["旧组1", "旧组2"]:
+            old_group = next(g for g in groups if g["name"] == old_name)
+            self.assertNotIn("a.md", old_group["files"])
+
+    def test_groups_safe_with_corrupted_index(self):
+        index = {
+            "_group_好": {"name": "好", "files": ["a.md", 123, None, {"a": "b"}], "collapsed": False, "created_at": "", "updated_at": ""},
+            "_group_坏": {"name": "坏", "files": "../../etc/passwd", "collapsed": "yes", "created_at": "", "updated_at": ""},
+        }
+        with open(os.path.join(self.tmpdir, ".index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        status, _, body = self._request("/api/groups")
+        self.assertEqual(status, 200)
+        groups = json.loads(body)
+        good = next(g for g in groups if g["name"] == "好")
+        self.assertEqual(good["files"], ["a.md"])
+        self.assertFalse(good["collapsed"])
+        bad = next(g for g in groups if g["name"] == "坏")
+        self.assertEqual(bad["files"], [])
+        self.assertFalse(bad["collapsed"])
+        self.assertNotIn("/Users/", body)
+        self.assertNotIn("/etc/", body)
+
+    def test_group_toggle_non_bool_collapsed_rejected(self):
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        for bad in ["true", 1, 0, []]:
+            payload = json.dumps({"name": "工作", "collapsed": bad}).encode("utf-8")
+            status, _, body = self._request(
+                "/api/group/toggle",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                },
+                data=payload,
+            )
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertFalse(data["ok"])
+
+    def test_group_remove_null_group_rejected(self):
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "工作"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "工作"}).encode("utf-8"),
+        )
+        payload = json.dumps({"group": None, "file": "a.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/remove",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+
+    def test_group_ops_safe_with_corrupted_target_group(self):
+        index = {
+            "_group_工作": {"name": "工作", "files": "broken", "collapsed": "yes", "created_at": "", "updated_at": ""},
+        }
+        with open(os.path.join(self.tmpdir, ".index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+        with open(os.path.join(self.tmpdir, "a.md"), "w", encoding="utf-8") as f:
+            f.write("# A\n\nbody")
+        self._start_server()
+        post_headers = {
+            "Host": f"localhost:{self.port}",
+            "Origin": f"http://localhost:{self.port}",
+            "Content-Type": "application/json",
+        }
+        payload = json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8")
+        post_headers["Content-Length"] = str(len(payload))
+        status, _, body = self._request(
+            "/api/group/add",
+            method="POST",
+            headers=post_headers,
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        _, _, groups_body = self._request("/api/groups")
+        groups = json.loads(groups_body)
+        work = next(g for g in groups if g["name"] == "工作")
+        self.assertEqual(work["files"], ["a.md"])
+        payload = json.dumps({"group": "工作", "file": "a.md"}).encode("utf-8")
+        post_headers["Content-Length"] = str(len(payload))
+        status, _, body = self._request(
+            "/api/group/remove",
+            method="POST",
+            headers=post_headers,
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        payload = json.dumps({"name": "工作", "collapsed": True}).encode("utf-8")
+        post_headers["Content-Length"] = str(len(payload))
+        status, _, body = self._request(
+            "/api/group/toggle",
+            method="POST",
+            headers=post_headers,
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["collapsed"])
+
+    def test_group_rename_non_string_params_soft_error(self):
+        self._start_server()
+        self._request(
+            "/api/group/create",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(json.dumps({"name": "旧组"}).encode("utf-8"))),
+            },
+            data=json.dumps({"name": "旧组"}).encode("utf-8"),
+        )
+        for bad in [123, None, [], {}]:
+            payload = json.dumps({"old_name": bad, "new_name": "新组"}).encode("utf-8")
+            status, _, body = self._request(
+                "/api/group/rename",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                },
+                data=payload,
+            )
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertFalse(data["ok"])
+        payload = json.dumps({"old_name": "旧组", "new_name": []}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/group/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

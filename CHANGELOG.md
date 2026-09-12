@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-12
+
+### Added
+
+- 分组折叠管理（虚拟分组，数据存储在 `.index.json`）
+- 三种创建/添加方式：拖拽文件新建组、拖入已有组、批量勾选加入组
+- 分组视图（第 4 种视图模式）：组头可折叠/展开、重命名、解散
+- 移动端降级：文件操作行「加入分组」按钮 + 分组选择器
+- 组与 rename/delete 联动：重命名自动迁移组成员，删除后空组保留（需手动解散）
+
+### API
+
+- `GET /api/groups`：列出所有组
+- `POST /api/group/create`：创建组
+- `POST /api/group/add`：文件加入组（自动移出旧组）
+- `POST /api/group/remove`：文件移出组（支持按组名或按文件名）
+- `POST /api/group/rename`：重命名组
+- `POST /api/group/disband`：解散组（文件回未分组）
+- `POST /api/group/toggle`：切换折叠状态
+
+### Security
+
+- 组操作继承 Host/Origin 校验
+- 单成员约束服务端强制（文件自动移出旧组）
+- 组名校验防止路径穿越与内部键冲突
+- 空组持久化（不自动解散，仅显式解散）
+
 ## [0.2.0] - 2026-09-12
 
 ### Added
