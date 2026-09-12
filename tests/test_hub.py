@@ -400,6 +400,46 @@ class TestRealHTTPIntegration(_HTTPServerFixture):
         self.assertNotIn("source", link_note)
         self.assertIn("source_label", link_note)
 
+    def test_view_save_and_list_roundtrip(self):
+        self._start_server()
+        payload = json.dumps({"name": "rt-view", "filters": {"search": "alpha"}}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/views/save",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        status, _, body = self._request("/api/views")
+        views = json.loads(body)
+        self.assertIn("rt-view", views)
+        self.assertEqual(views["rt-view"]["filters"], {"search": "alpha"})
+
+    def test_delete_response_has_no_absolute_path(self):
+        self._start_server()
+        with open(os.path.join(self.tmpdir, "del.md"), "w", encoding="utf-8") as f:
+            f.write("# Del\n\ntags: t\n\nbody")
+        payload = json.dumps({"file": "del.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/delete",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("/", json.loads(body).get("trash", ""))
+        self.assertNotIn("tmp", body)
+
     def test_discover_returns_no_absolute_path(self):
         d = os.path.join(self.tmpdir, "discover_src")
         os.makedirs(d, exist_ok=True)

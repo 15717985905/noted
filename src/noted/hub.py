@@ -829,9 +829,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         notes_dir = get_notes_dir()
         index = load_index(notes_dir)
         views = {}
-        for filename, entry in index.items():
-            if entry.get("view"):
-                views[filename] = entry
+        for _, entry in index.items():
+            if entry.get("view") and entry.get("name"):
+                views[entry["name"]] = {
+                    "name": entry["name"],
+                    "filters": entry.get("filters", {}),
+                    "updated_at": entry.get("updated_at", ""),
+                }
         self.send_json(views)
 
     def send_tags(self, data):
@@ -900,12 +904,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             os.remove(path)
         else:
             os.rename(path, trash_path)
-        self.send_json({"ok": True, "trash": trash_path})
+        self.send_json({"ok": True, "trash": os.path.basename(trash_path)})
 
     def send_save_view(self, data):
         name = data.get("name", "")
         filters = data.get("filters", {})
-        if not name:
+        if not name or len(name) > 64 or any(c in name for c in "\\/:\0"):
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -913,6 +917,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         view_key = f"_view_{name}"
         index[view_key] = {
             "name": name,
+            "view": True,
             "filters": filters,
             "updated_at": datetime.now().isoformat(),
         }
