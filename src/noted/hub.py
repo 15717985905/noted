@@ -9,6 +9,7 @@ import json
 import re
 import sys
 import subprocess
+import shlex
 import urllib.parse
 import secrets
 import threading
@@ -521,6 +522,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_views()
         elif path == "/api/discover":
             self.send_discover()
+        elif path == "/api/detail":
+            qs = urllib.parse.parse_qs(parsed.query)
+            filename = qs.get("file", [""])[0]
+            self.send_detail(filename)
         else:
             self.send_error(404)
 
@@ -554,6 +559,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_discover_ignore(data)
         elif path == "/api/discover/add":
             self.send_discover_add(data)
+        elif path == "/api/reveal":
+            self.send_reveal(data)
+        elif path == "/api/open":
+            self.send_open(data)
         else:
             self.send_error(404)
 
@@ -839,6 +848,83 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     "updated_at": entry.get("updated_at", ""),
                 }
         self.send_json(views)
+
+    def send_detail(self, filename):
+        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+            self.send_error(400)
+            return
+        notes_dir = get_notes_dir()
+        path = os.path.join(notes_dir, filename)
+        if not os.path.isfile(path) and not os.path.islink(path):
+            self.send_error(404)
+            return
+        is_symlink = os.path.islink(path)
+        kind = "symlink" if is_symlink else "local"
+        source_label = ""
+        real_path = ""
+        exists = True
+        if is_symlink:
+            try:
+                real_path = os.path.realpath(path)
+                source_label = os.path.basename(os.path.dirname(real_path))
+                if not source_label or source_label == notes_dir:
+                    source_label = "notes"
+                exists = os.path.isfile(real_path)
+            except Exception:
+                exists = False
+        else:
+            real_path = os.path.abspath(path)
+            source_label = "notes"
+        self.send_json({
+            "file": filename,
+            "kind": kind,
+            "path": real_path,
+            "source_label": source_label,
+            "exists": exists,
+        })
+
+    def send_reveal(self, data):
+        filename = data.get("file", "")
+        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+            self.send_error(400)
+            return
+        notes_dir = get_notes_dir()
+        path = os.path.join(notes_dir, filename)
+        if not os.path.isfile(path):
+            self.send_error(404)
+            return
+        real_path = os.path.realpath(path)
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(["open", "-R", real_path], check=False)
+            else:
+                subprocess.run(["xdg-open", os.path.dirname(real_path)], check=False)
+            self.send_json({"ok": True})
+        except Exception as e:
+            self.send_json({"ok": False, "error": str(e)})
+
+    def send_open(self, data):
+        filename = data.get("file", "")
+        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+            self.send_error(400)
+            return
+        notes_dir = get_notes_dir()
+        path = os.path.join(notes_dir, filename)
+        if not os.path.isfile(path):
+            self.send_error(404)
+            return
+        real_path = os.path.realpath(path)
+        try:
+            editor = os.environ.get("NOTED_EDITOR")
+            if editor:
+                subprocess.Popen(shlex.split(editor) + [real_path])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", real_path])
+            else:
+                subprocess.Popen(["xdg-open", real_path])
+            self.send_json({"ok": True})
+        except Exception as e:
+            self.send_json({"ok": False, "error": str(e)})
 
     def send_tags(self, data):
         filename = data.get("file", "")
@@ -1612,6 +1698,14 @@ HTML = """<!DOCTYPE html>
     <div id="reader" class="reader" data-file="">
       <span class="reader-back" data-action="showList">← 返回列表</span>
       <button class="btn" data-action="renameReaderNote" id="reader-rename-btn" style="display:none;margin-left:8px;">重命名</button>
+      <div id="reader-meta" style="display:none;padding:8px 12px;background:#f5f5f7;border-radius:8px;margin:8px 0;font-size:13px;">
+        <span id="reader-kind" style="display:inline-block;padding:2px 8px;border-radius:4px;background:#e5e5e5;margin-right:8px;"></span>
+        <span id="reader-path" style="font-family:monospace;color:#86868b;word-break:break-all;"></span>
+        <button class="btn" data-action="copyReaderPath" style="margin-left:8px;padding:2px 8px;font-size:12px;">复制路径</button>
+        <button class="btn" data-action="revealReaderFile" style="margin-left:4px;padding:2px 8px;font-size:12px;">在 Finder 中显示</button>
+        <button class="btn" data-action="openReaderFile" style="margin-left:4px;padding:2px 8px;font-size:12px;">打开</button>
+        <span id="reader-feedback" style="margin-left:8px;color:#007aff;font-size:12px;display:none;"></span>
+      </div>
       <div id="reader-content"></div>
       <div class="related-section" id="related-section" style="display:none;">
         <div class="related-title">相关笔记</div>
@@ -1875,6 +1969,7 @@ HTML = """<!DOCTYPE html>
             <button class="btn btn-primary" data-action="editTags" data-file="${escapeHtml(n.file)}">标签</button>
             <button class="btn" data-action="addNote" data-file="${escapeHtml(n.file)}">备注</button>
             <button class="btn" data-action="renameNote" data-file="${escapeHtml(n.file)}" data-symlink="${n.is_symlink ? '1' : '0'}" data-source-label="${escapeHtml(n.source_label || '')}">重命名</button>
+            <button class="btn" data-action="revealNote" data-file="${escapeHtml(n.file)}" title="在 Finder 中显示">📂</button>
             <button class="btn btn-danger" data-action="deleteNote" data-file="${escapeHtml(n.file)}">删除</button>
           </div>
         </div>
@@ -1894,7 +1989,102 @@ HTML = """<!DOCTYPE html>
         document.getElementById('reader-rename-btn').style.display = 'inline-block';
         window.scrollTo(0, 0);
         renderRelatedNotes(file);
+        loadReaderDetail(file);
       } catch (e) { console.error(e); }
+    }
+
+    async function loadReaderDetail(file) {
+      try {
+        const res = await fetch('/api/detail?file=' + encodeURIComponent(file));
+        if (!res.ok) return;
+        const data = await res.json();
+        const meta = document.getElementById('reader-meta');
+        const kindEl = document.getElementById('reader-kind');
+        const pathEl = document.getElementById('reader-path');
+        const revealBtn = document.querySelector('[data-action="revealReaderFile"]');
+        const openBtn = document.querySelector('[data-action="openReaderFile"]');
+        meta.style.display = 'block';
+        kindEl.textContent = data.kind === 'symlink' ? `软链接 · ${escapeHtml(data.source_label || '')}` : '本地文件';
+        pathEl.textContent = data.path || '';
+        if (!data.exists) {
+          kindEl.textContent = '断链';
+          kindEl.style.background = '#ff3b30';
+          kindEl.style.color = '#fff';
+          if (revealBtn) revealBtn.disabled = true;
+          if (openBtn) openBtn.disabled = true;
+        } else {
+          kindEl.style.background = '#e5e5e5';
+          kindEl.style.color = '#1d1d1f';
+          if (revealBtn) revealBtn.disabled = false;
+          if (openBtn) openBtn.disabled = false;
+        }
+      } catch (e) { console.error(e); }
+    }
+
+    function flashFeedback(text) {
+      const el = document.getElementById('reader-feedback');
+      if (!el) return;
+      el.textContent = text;
+      el.style.display = 'inline';
+      setTimeout(() => { el.style.display = 'none'; }, 1500);
+    }
+
+    async function copyReaderPath() {
+      const text = document.getElementById('reader-path').textContent;
+      if (!text) return;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          document.body.removeChild(ta);
+        }
+        flashFeedback('已复制');
+      } catch (e) {
+        flashFeedback('复制失败');
+      }
+    }
+
+    async function revealFile(file) {
+      file = file || (document.getElementById('reader').dataset.file || '');
+      if (!file) return;
+      try {
+        const res = await fetch('/api/reveal', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({file}),
+        });
+        const data = await res.json();
+        if (data.ok) flashFeedback('已打开');
+        else flashFeedback('失败');
+      } catch (e) {
+        flashFeedback('失败');
+      }
+    }
+
+    async function revealReaderFile() {
+      await revealFile('');
+    }
+
+    async function openReaderFile() {
+      const file = document.getElementById('reader').dataset.file || '';
+      if (!file) return;
+      try {
+        const res = await fetch('/api/open', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({file}),
+        });
+        const data = await res.json();
+        if (data.ok) flashFeedback('已打开');
+        else flashFeedback('失败');
+      } catch (e) {
+        flashFeedback('失败');
+      }
     }
 
     async function renderRelatedNotes(currentFile) {
@@ -2251,6 +2441,7 @@ HTML = """<!DOCTYPE html>
         else if (action === 'editTags') editTags(file);
         else if (action === 'addNote') addNote(file);
         else if (action === 'renameNote') showRenameModal(file, btn.dataset.symlink === '1', btn.dataset.sourceLabel || '');
+        else if (action === 'revealNote') revealFile(btn.dataset.file);
         else if (action === 'deleteNote') deleteNote(file);
         return;
       }
@@ -2321,6 +2512,12 @@ HTML = """<!DOCTYPE html>
           showRenameModal(file, !!(note && note.is_symlink), note ? (note.source_label || '') : '');
         }
       }
+      const copyBtn = e.target.closest('[data-action="copyReaderPath"]');
+      if (copyBtn) copyReaderPath();
+      const revealBtn = e.target.closest('[data-action="revealReaderFile"]');
+      if (revealBtn) revealReaderFile();
+      const openBtn = e.target.closest('[data-action="openReaderFile"]');
+      if (openBtn) openReaderFile();
     });
 
     document.getElementById('modal-overlay').addEventListener('click', e => {

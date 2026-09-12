@@ -1137,5 +1137,183 @@ class TestRename(_HTTPServerFixture):
         self.assertEqual(status, 404)
 
 
+class TestFileDetail(_HTTPServerFixture):
+    def test_detail_local_file(self):
+        with open(os.path.join(self.tmpdir, "local.md"), "w", encoding="utf-8") as f:
+            f.write("# Local\n\nbody")
+        self._start_server()
+        status, _, body = self._request("/api/detail?file=local.md")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["file"], "local.md")
+        self.assertEqual(data["kind"], "local")
+        self.assertTrue(data["path"].startswith(self.tmpdir))
+        self.assertEqual(data["source_label"], "notes")
+        self.assertTrue(data["exists"])
+
+    def test_detail_symlink(self):
+        target = os.path.join(self.tmpdir, "real.md")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("# Real\n\nbody")
+        link = os.path.join(self.tmpdir, "link.md")
+        os.symlink(target, link)
+        self._start_server()
+        status, _, body = self._request("/api/detail?file=link.md")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["file"], "link.md")
+        self.assertEqual(data["kind"], "symlink")
+        self.assertEqual(data["path"], os.path.realpath(target))
+        self.assertTrue(data["exists"])
+
+    def test_detail_broken_symlink(self):
+        target = os.path.join(self.tmpdir, "ghost.md")
+        link = os.path.join(self.tmpdir, "link.md")
+        os.symlink(target, link)
+        self._start_server()
+        status, _, body = self._request("/api/detail?file=link.md")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(data["kind"], "symlink")
+        self.assertFalse(data["exists"])
+
+    def test_detail_missing_404(self):
+        self._start_server()
+        status, _, _ = self._request("/api/detail?file=missing.md")
+        self.assertEqual(status, 404)
+
+    def test_detail_traversal_400(self):
+        self._start_server()
+        status, _, _ = self._request("/api/detail?file=../outside.md")
+        self.assertEqual(status, 400)
+
+    def test_detail_malicious_host_403(self):
+        with open(os.path.join(self.tmpdir, "x.md"), "w", encoding="utf-8") as f:
+            f.write("# X\n\nbody")
+        self._start_server()
+        req = urllib.request.Request(self._url("/api/detail?file=x.md"))
+        req.add_header("Host", "evil.com")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.fail(f"Expected 403 but got {resp.status}")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 403)
+
+    def test_reveal_success(self):
+        with open(os.path.join(self.tmpdir, "local.md"), "w", encoding="utf-8") as f:
+            f.write("# Local\n\nbody")
+        self._start_server()
+        with mock.patch("subprocess.run") as mock_run:
+            payload = json.dumps({"file": "local.md"}).encode("utf-8")
+            status, _, body = self._request(
+                "/api/reveal",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                },
+                data=payload,
+            )
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertTrue(data["ok"])
+            mock_run.assert_called_once()
+
+    def test_open_success(self):
+        with open(os.path.join(self.tmpdir, "local.md"), "w", encoding="utf-8") as f:
+            f.write("# Local\n\nbody")
+        self._start_server()
+        with mock.patch("subprocess.Popen") as mock_popen:
+            payload = json.dumps({"file": "local.md"}).encode("utf-8")
+            status, _, body = self._request(
+                "/api/open",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(payload)),
+                },
+                data=payload,
+            )
+            self.assertEqual(status, 200)
+            data = json.loads(body)
+            self.assertTrue(data["ok"])
+            mock_popen.assert_called_once()
+
+    def test_open_with_editor_env(self):
+        with open(os.path.join(self.tmpdir, "local.md"), "w", encoding="utf-8") as f:
+            f.write("# Local\n\nbody")
+        self._start_server()
+        with mock.patch.dict(os.environ, {"NOTED_EDITOR": "vim"}):
+            with mock.patch("subprocess.Popen") as mock_popen:
+                payload = json.dumps({"file": "local.md"}).encode("utf-8")
+                status, _, body = self._request(
+                    "/api/open",
+                    method="POST",
+                    headers={
+                        "Host": f"localhost:{self.port}",
+                        "Origin": f"http://localhost:{self.port}",
+                        "Content-Type": "application/json",
+                        "Content-Length": str(len(payload)),
+                    },
+                    data=payload,
+                )
+                self.assertEqual(status, 200)
+                data = json.loads(body)
+                self.assertTrue(data["ok"])
+                args, _ = mock_popen.call_args
+                self.assertEqual(args[0][0], "vim")
+
+    def test_reveal_open_missing_file_404(self):
+        self._start_server()
+        payload = json.dumps({"file": "missing.md"}).encode("utf-8")
+        status, _, _ = self._request(
+            "/api/reveal",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 404)
+
+        status, _, _ = self._request(
+            "/api/open",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 404)
+
+    def test_list_has_no_absolute_path(self):
+        with open(os.path.join(self.tmpdir, "note.md"), "w", encoding="utf-8") as f:
+            f.write("# Note\n\nbody")
+        self._start_server()
+        status, _, body = self._request("/api/list")
+        self.assertEqual(status, 200)
+        self.assertNotIn("/Users/", body)
+        self.assertNotIn("/home/", body)
+
+    def test_responses_have_no_cors_header(self):
+        with open(os.path.join(self.tmpdir, "note.md"), "w", encoding="utf-8") as f:
+            f.write("# Note\n\nbody")
+        self._start_server()
+        _, headers, _ = self._request("/api/list")
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+        _, headers, _ = self._request("/api/detail?file=note.md")
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-12
+
+### Added
+
+- 阅读页文件信息区：显示文件类型（本地文件/软链接·来源目录）、绝对路径（点击复制）、"在 Finder 中显示"与"打开"按钮
+- 列表平铺视图操作行新增 📂 按钮（data-action="reveal"），点击后在 Finder 中显示对应文件
+- `GET /api/detail`：返回 `{file, kind, path, source_label, exists}`，symlink 返回源文件 realpath，local 返回 notes_dir 绝对路径
+- `POST /api/reveal`：macOS 用 `open -R`，其他平台用 `xdg-open` 打开所在目录
+- `POST /api/open`：支持 `NOTED_EDITOR` 环境变量（shlex.split + Popen），否则 macOS `open` / 其他 `xdg-open`
+- 断链软链接在阅读页显示红色"断链"状态并禁用按钮
+
+### Security
+
+- 路径按需提供：仅通过 `/api/detail`、`/api/reveal`、`/api/open` 三个接口返回绝对路径
+- 所有路径接口继承 Host/Origin 校验，响应不带 `Access-Control-Allow-Origin`
+- 127.0.0.1 绑定 + Host 校验防止 DNS 重绑定 + 无 CORS 头 = 跨站无法读取路径
+
 ## [0.1.2] - 2026-09-12
 
 ### Added
