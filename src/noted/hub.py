@@ -667,7 +667,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             info = self._parse_note(notes_dir, f, path, full_content=True)
             if not info:
                 continue
-            haystack = f"{info['title']} {' '.join(info['tags'])} {info['excerpt']} {info['content']}".lower()
+            haystack = f"{info['file']} {info['title']} {' '.join(info['tags'])} {info['excerpt']} {info['content']}".lower()
             if term_lower in haystack:
                 info["_highlight"] = True
                 results.append(info)

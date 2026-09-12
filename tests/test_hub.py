@@ -308,6 +308,16 @@ class TestRealHTTPIntegration(_HTTPServerFixture):
         self.assertEqual(len(data), 1)
         self.assertEqual(data[0]["file"], "alpha.md")
 
+    def test_search_matches_filename(self):
+        with open(os.path.join(self.tmpdir, "MDM-experiment-summary.md"), "w", encoding="utf-8") as f:
+            f.write("# 中文标题不在查询词内\n\ntags: x\n\n正文")
+        self._start_server()
+        status, headers, body = self._request("/api/search?q=MDM")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]["file"], "MDM-experiment-summary.md")
+
     def test_same_origin_post_star_succeeds(self):
         with open(os.path.join(self.tmpdir, "star.md"), "w", encoding="utf-8") as f:
             f.write("# Star\n\ntags: test\n\nbody")
