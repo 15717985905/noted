@@ -817,5 +817,325 @@ class TestCLIDoctor(unittest.TestCase):
                 os.environ["NOTED_HOME"] = old
 
 
+class TestRename(_HTTPServerFixture):
+    def test_rename_real_file_success(self):
+        with open(os.path.join(self.tmpdir, "old.md"), "w", encoding="utf-8") as f:
+            f.write("# Old\n\ntags: a\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "old.md", "new_name": "new.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["file"], "new.md")
+        self.assertFalse(os.path.isfile(os.path.join(self.tmpdir, "old.md")))
+        self.assertTrue(os.path.isfile(os.path.join(self.tmpdir, "new.md")))
+        with open(os.path.join(self.tmpdir, "new.md"), "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "# Old\n\ntags: a\n\nbody")
+
+    def test_rename_symlink_only_link_name(self):
+        target = os.path.join(self.tmpdir, "real.md")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("# Real\n\nbody")
+        link = os.path.join(self.tmpdir, "link.md")
+        os.symlink(target, link)
+        original_target = os.readlink(link)
+        self._start_server()
+        payload = json.dumps({"file": "link.md", "new_name": "newlink.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["file"], "newlink.md")
+        self.assertFalse(os.path.exists(link))
+        self.assertTrue(os.path.islink(os.path.join(self.tmpdir, "newlink.md")))
+        self.assertTrue(os.path.isfile(target))
+        self.assertEqual(os.readlink(os.path.join(self.tmpdir, "newlink.md")), original_target)
+
+    def test_rename_symlink_propagate(self):
+        target = os.path.join(self.tmpdir, "real.md")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("# Real\n\nbody")
+        link = os.path.join(self.tmpdir, "link.md")
+        os.symlink(target, link)
+        self._start_server()
+        payload = json.dumps({"file": "link.md", "new_name": "new.md", "propagate": True}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["propagated"])
+        self.assertFalse(os.path.exists(link))
+        self.assertTrue(os.path.isfile(os.path.join(self.tmpdir, "new.md")))
+        self.assertFalse(os.path.isfile(target))
+
+    def test_rename_propagate_non_symlink_rejected(self):
+        with open(os.path.join(self.tmpdir, "real.md"), "w", encoding="utf-8") as f:
+            f.write("# Real\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "real.md", "new_name": "new.md", "propagate": True}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertFalse(data.get("ok"))
+        self.assertIn("软链接", data.get("error", ""))
+
+    def test_rename_propagate_shared_realpath_rejected(self):
+        target = os.path.join(self.tmpdir, "real.md")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("# Real\n\nbody")
+        link1 = os.path.join(self.tmpdir, "link1.md")
+        link2 = os.path.join(self.tmpdir, "link2.md")
+        os.symlink(target, link1)
+        os.symlink(target, link2)
+        self._start_server()
+        payload = json.dumps({"file": "link1.md", "new_name": "new.md", "propagate": True}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertFalse(data.get("ok"))
+        self.assertIn("链接", data.get("error", ""))
+
+    def test_rename_same_name_conflict(self):
+        with open(os.path.join(self.tmpdir, "exist.md"), "w", encoding="utf-8") as f:
+            f.write("# Exist\n\nbody")
+        with open(os.path.join(self.tmpdir, "old.md"), "w", encoding="utf-8") as f:
+            f.write("# Old\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "old.md", "new_name": "exist.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertFalse(data.get("ok"))
+
+    def test_rename_traversal_rejected(self):
+        with open(os.path.join(self.tmpdir, "old.md"), "w", encoding="utf-8") as f:
+            f.write("# Old\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "old.md", "new_name": "../escape.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 400)
+
+    def test_rename_reserved_name_rejected(self):
+        with open(os.path.join(self.tmpdir, "old.md"), "w", encoding="utf-8") as f:
+            f.write("# Old\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "old.md", "new_name": ".index.json"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertFalse(data.get("ok"))
+
+    def test_rename_migrates_star_and_tags(self):
+        index = {"old.md": {"tags": ["a", "b"], "starred": True, "note": "note1"}}
+        with open(os.path.join(self.tmpdir, ".index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+        with open(os.path.join(self.tmpdir, "old.md"), "w", encoding="utf-8") as f:
+            f.write("# Old\n\ntags: x\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "old.md", "new_name": "new.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        with open(os.path.join(self.tmpdir, ".index.json"), "r", encoding="utf-8") as f:
+            idx = json.load(f)
+        self.assertIn("new.md", idx)
+        self.assertEqual(idx["new.md"]["tags"], ["a", "b"])
+        self.assertTrue(idx["new.md"]["starred"])
+        self.assertEqual(idx["new.md"]["note"], "note1")
+        self.assertNotIn("old.md", idx)
+
+    def test_rename_update_h1(self):
+        with open(os.path.join(self.tmpdir, "old.md"), "w", encoding="utf-8") as f:
+            f.write("# Old\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "old.md", "new_name": "new.md", "update_h1": True}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["h1_updated"])
+        with open(os.path.join(self.tmpdir, "new.md"), "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "# new\n\nbody")
+
+    def test_rename_update_h1_no_h1(self):
+        with open(os.path.join(self.tmpdir, "old.md"), "w", encoding="utf-8") as f:
+            f.write("no heading\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "old.md", "new_name": "new.md", "update_h1": True}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertFalse(data["h1_updated"])
+
+    def test_rename_then_sync_no_duplicate(self):
+        target = os.path.join(self.tmpdir, "real.md")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("# Real\n\nbody")
+        link = os.path.join(self.tmpdir, "link.md")
+        os.symlink(target, link)
+        self._start_server()
+        payload = json.dumps({"file": "link.md", "new_name": "newlink.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        _, _, sync_body = self._request("/api/sync")
+        sync_data = json.loads(sync_body)
+        self.assertEqual(sync_data["count"], 0)
+
+    def test_rename_malicious_host_rejected(self):
+        with open(os.path.join(self.tmpdir, "old.md"), "w", encoding="utf-8") as f:
+            f.write("# Old\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "old.md", "new_name": "new.md"}).encode("utf-8")
+        req = urllib.request.Request(self._url("/api/rename"), data=payload, method="POST")
+        req.add_header("Host", "evil.com")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Content-Length", str(len(payload)))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = resp.read().decode("utf-8")
+                self.fail(f"Expected 403 but got {resp.status}: {body[:100]}")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 403)
+
+    def test_rename_missing_file_404(self):
+        self._start_server()
+        payload = json.dumps({"file": "missing.md", "new_name": "new.md"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/rename",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 404)
+
+
 if __name__ == "__main__":
     unittest.main()

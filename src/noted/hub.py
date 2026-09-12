@@ -546,6 +546,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_star(data)
         elif path == "/api/delete":
             self.send_delete(data)
+        elif path == "/api/rename":
+            self.send_rename(data)
         elif path == "/api/views/save":
             self.send_save_view(data)
         elif path == "/api/discover/ignore":
@@ -905,6 +907,144 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         else:
             os.rename(path, trash_path)
         self.send_json({"ok": True, "trash": os.path.basename(trash_path)})
+
+    def send_rename(self, data):
+        filename = data.get("file", "")
+        new_name = data.get("new_name", "")
+        update_h1 = bool(data.get("update_h1", False))
+        propagate = bool(data.get("propagate", False))
+
+        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+            self.send_error(400)
+            return
+        if not new_name:
+            self.send_error(400)
+            return
+
+        notes_dir = get_notes_dir()
+        old_path = os.path.join(notes_dir, filename)
+        if not os.path.isfile(old_path):
+            self.send_error(404)
+            return
+
+        base, ext = os.path.splitext(new_name.strip())
+        if not base:
+            self.send_error(400)
+            return
+        if len(new_name.strip()) > 200:
+            self.send_error(400)
+            return
+        if any(c in new_name for c in "/\\\0"):
+            self.send_error(400)
+            return
+        if ".." in new_name:
+            self.send_error(400)
+            return
+        if base.startswith("."):
+            self.send_json({"ok": False, "error": "不能以点开头的隐藏文件名"})
+            return
+        if ext.lower() != ".md":
+            new_name = f"{base}.md"
+        else:
+            new_name = f"{base}{ext}"
+
+        if new_name in EXCLUDE_FILES:
+            self.send_json({"ok": False, "error": "该文件名被保留，请更换"})
+            return
+        if new_name == filename:
+            self.send_json({"ok": False, "error": "新文件名与原名相同"})
+            return
+
+        new_path = os.path.join(notes_dir, new_name)
+        if os.path.exists(new_path):
+            self.send_json({"ok": False, "error": f"已存在同名文件: {new_name}"})
+            return
+
+        is_symlink = os.path.islink(old_path)
+        propagated = False
+        h1_updated = False
+
+        if propagate and not is_symlink:
+            self.send_json({"ok": False, "error": "仅软链接支持同步重命名源文件"})
+            return
+
+        if propagate and is_symlink:
+            real_path = os.path.realpath(old_path)
+            if not os.path.isfile(real_path):
+                self.send_json({"ok": False, "error": "源文件不存在"})
+                return
+            real_dir = os.path.dirname(real_path)
+            new_target_name = f"{base}{ext}"
+            new_target_path = os.path.join(real_dir, new_target_name)
+            if os.path.exists(new_target_path):
+                self.send_json({"ok": False, "error": "源文件目标名已存在"})
+                return
+            linked_targets = []
+            for f in os.listdir(notes_dir):
+                if f.endswith(".md") and f != filename and os.path.islink(os.path.join(notes_dir, f)):
+                    try:
+                        linked_targets.append(os.path.realpath(os.path.join(notes_dir, f)))
+                    except Exception:
+                        pass
+            if real_path in linked_targets:
+                self.send_json({"ok": False, "error": "有其他链接指向同一源文件，请先解除"})
+                return
+
+            try:
+                os.rename(real_path, new_target_path)
+                os.remove(old_path)
+                if os.path.realpath(new_target_path) != os.path.realpath(new_path):
+                    rel = os.path.relpath(new_target_path, os.path.realpath(notes_dir))
+                    os.symlink(rel, new_path)
+                propagated = True
+            except Exception as e:
+                try:
+                    if os.path.islink(new_path):
+                        os.remove(new_path)
+                except Exception:
+                    pass
+                try:
+                    if not os.path.exists(real_path) and os.path.exists(new_target_path):
+                        os.rename(new_target_path, real_path)
+                except Exception:
+                    pass
+                self.send_json({"ok": False, "error": f"同步重命名失败: {e}"})
+                return
+
+        if not propagated:
+            try:
+                os.rename(old_path, new_path)
+            except Exception as e:
+                self.send_json({"ok": False, "error": f"重命名失败: {e}"})
+                return
+
+        index = load_index(notes_dir)
+        if filename in index:
+            index[new_name] = index.pop(filename)
+        note_key_old = f"_note_{filename}"
+        note_key_new = f"_note_{new_name}"
+        if note_key_old in index:
+            index[note_key_new] = index.pop(note_key_old)
+        save_index(notes_dir, index)
+
+        if update_h1:
+            target_path = new_path
+            if propagated:
+                target_path = new_target_path
+            try:
+                with open(target_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                for i, line in enumerate(lines[:50]):
+                    if line.strip().startswith("# "):
+                        lines[i] = f"# {base}\n"
+                        with open(target_path, "w", encoding="utf-8") as f:
+                            f.writelines(lines)
+                        h1_updated = True
+                        break
+            except Exception:
+                pass
+
+        self.send_json({"ok": True, "file": new_name, "h1_updated": h1_updated, "propagated": propagated})
 
     def send_save_view(self, data):
         name = data.get("name", "")
@@ -1469,8 +1609,9 @@ HTML = """<!DOCTYPE html>
     </div>
     <div class="note-count" id="note-count"></div>
     <div id="note-list"></div>
-    <div id="reader" class="reader">
+    <div id="reader" class="reader" data-file="">
       <span class="reader-back" data-action="showList">← 返回列表</span>
+      <button class="btn" data-action="renameReaderNote" id="reader-rename-btn" style="display:none;margin-left:8px;">重命名</button>
       <div id="reader-content"></div>
       <div class="related-section" id="related-section" style="display:none;">
         <div class="related-title">相关笔记</div>
@@ -1733,6 +1874,7 @@ HTML = """<!DOCTYPE html>
           <div class="note-actions">
             <button class="btn btn-primary" data-action="editTags" data-file="${escapeHtml(n.file)}">标签</button>
             <button class="btn" data-action="addNote" data-file="${escapeHtml(n.file)}">备注</button>
+            <button class="btn" data-action="renameNote" data-file="${escapeHtml(n.file)}" data-symlink="${n.is_symlink ? '1' : '0'}" data-source-label="${escapeHtml(n.source_label || '')}">重命名</button>
             <button class="btn btn-danger" data-action="deleteNote" data-file="${escapeHtml(n.file)}">删除</button>
           </div>
         </div>
@@ -1748,6 +1890,8 @@ HTML = """<!DOCTYPE html>
         document.getElementById('empty').style.display = 'none';
         document.getElementById('discover-panel').style.display = 'none';
         document.getElementById('reader').style.display = 'block';
+        document.getElementById('reader').dataset.file = file;
+        document.getElementById('reader-rename-btn').style.display = 'inline-block';
         window.scrollTo(0, 0);
         renderRelatedNotes(file);
       } catch (e) { console.error(e); }
@@ -1965,6 +2109,77 @@ HTML = """<!DOCTYPE html>
     function closeModal() {
       document.getElementById('modal-overlay').style.display = 'none';
     }
+    let renameCurrentFile = '';
+    function showRenameModal(file, isSymlink, sourceLabel) {
+      renameCurrentFile = file;
+      const base = file.replace(/[.]md$/i, '');
+      const modal = document.getElementById('modal');
+      const body = document.getElementById('modal-body');
+      const actions = document.getElementById('modal-actions');
+      document.getElementById('modal-title').textContent = '重命名';
+      body.innerHTML = `
+        <div style="display:flex;flex-direction:column;gap:12px;">
+          <div>
+            <label style="display:block;font-size:13px;color:#86868b;margin-bottom:4px;">文件名</label>
+            <input id="rename-input" type="text" value="${escapeHtml(base)}" style="width:100%;padding:8px 12px;border:1px solid #d2d2d7;border-radius:8px;font-size:15px;" />
+            <div id="rename-error" style="color:#ff3b30;font-size:13px;margin-top:4px;display:none;"></div>
+          </div>
+          <label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer;">
+            <input id="rename-update-h1" type="checkbox" checked /> 同时更新正文 H1 标题
+          </label>
+          ${isSymlink ? `<label style="display:flex;align-items:center;gap:8px;font-size:14px;cursor:pointer;">
+            <input id="rename-propagate" type="checkbox" /> 同步重命名源文件（来源: ${escapeHtml(sourceLabel || '')}）
+          </label>` : ''}
+        </div>
+      `;
+      actions.innerHTML = `
+        <button class="btn" data-modal-action="0">取消</button>
+        <button class="btn btn-primary" data-modal-action="1">确认</button>
+      `;
+      actions._actions = [
+        {text: '取消', class: 'btn', action: closeModal},
+        {text: '确认', class: 'btn btn-primary', action: submitRename},
+      ];
+      document.getElementById('modal-overlay').style.display = 'flex';
+      const input = document.getElementById('rename-input');
+      input.focus();
+      input.select();
+      input.onkeydown = (e) => { if (e.key === 'Enter') submitRename(); };
+    }
+    async function submitRename() {
+      const input = document.getElementById('rename-input');
+      const errorEl = document.getElementById('rename-error');
+      const updateH1 = document.getElementById('rename-update-h1').checked;
+      const propagate = document.getElementById('rename-propagate') ? document.getElementById('rename-propagate').checked : false;
+      const newName = input.value.trim();
+      if (!newName) {
+        errorEl.textContent = '文件名不能为空';
+        errorEl.style.display = 'block';
+        return;
+      }
+      try {
+        const res = await fetch('/api/rename', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({file: renameCurrentFile, new_name: newName, update_h1: updateH1, propagate: propagate}),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          errorEl.textContent = data.error || '重命名失败';
+          errorEl.style.display = 'block';
+          return;
+        }
+        closeModal();
+        loadList();
+        const currentFile = document.getElementById('reader').dataset.file || '';
+        if (currentFile && (currentFile === renameCurrentFile || currentFile === data.file)) {
+          openNote(data.file);
+        }
+      } catch (e) {
+        errorEl.textContent = '请求失败';
+        errorEl.style.display = 'block';
+      }
+    }
     async function doDiscover() {
       userInteracting = true;
       const panel = document.getElementById('discover-panel');
@@ -2035,6 +2250,7 @@ HTML = """<!DOCTYPE html>
         if (action === 'toggleStar') toggleStar(file);
         else if (action === 'editTags') editTags(file);
         else if (action === 'addNote') addNote(file);
+        else if (action === 'renameNote') showRenameModal(file, btn.dataset.symlink === '1', btn.dataset.sourceLabel || '');
         else if (action === 'deleteNote') deleteNote(file);
         return;
       }
@@ -2097,6 +2313,14 @@ HTML = """<!DOCTYPE html>
     document.querySelector('.reader').addEventListener('click', e => {
       const back = e.target.closest('[data-action="showList"]');
       if (back) showList();
+      const renameBtn = e.target.closest('[data-action="renameReaderNote"]');
+      if (renameBtn) {
+        const file = document.getElementById('reader').dataset.file || '';
+        if (file) {
+          const note = allNotes.find(n => n.file === file);
+          showRenameModal(file, !!(note && note.is_symlink), note ? (note.source_label || '') : '');
+        }
+      }
     });
 
     document.getElementById('modal-overlay').addEventListener('click', e => {

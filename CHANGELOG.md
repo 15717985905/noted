@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-09-12
+
+### Added
+
+- 网页端重命名：列表操作行与阅读页均提供"重命名"
+- 重命名弹窗：预填当前文件名，可选"同时更新正文 H1 标题"（默认开）与"同步重命名源文件"（仅软链接显示，标注来源目录名）
+- `POST /api/rename`：`{file, new_name, update_h1, propagate}`，响应不含绝对路径
+- 重命名随迁 `.index.json` 中的标签、星标、备注与 `_note_` 键
+
+### Security
+
+- 重命名强校验：拒绝路径穿越、非法字符、隐藏文件名、保留名、同名冲突
+- 联动源文件前检查 realpath 唯一性（多链接共享同一源文件时拒绝）
+- 源文件位于笔记目录内时自动降级为直接改名（不再创建自指链接）
+
 ## [0.1.1] - 2026-09-12
 
 ### Fixed

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "noted"
-version = "0.1.1"
+version = "0.1.2"
 description = "落笔 · Noted — 本地个人知识库，自动收纳 agent 总结，浏览器阅读"
 readme = "README.md"
 license = {text = "MIT"}
