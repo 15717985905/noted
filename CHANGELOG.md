@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] - 2026-09-12
+
+### Fixed
+
+- 全文搜索现包含文件名（此前仅匹配标题/标签/摘要/正文，按文件名关键词搜不到）
+- 自定义视图保存后可在 `/api/views` 正确列出（保存时补写 `view` 标志）
+- `/api/views` 响应按视图名作键，不再暴露内部 `_view_` 前缀存储键
+- `/api/delete` 响应不再返回回收站绝对路径，仅返回文件名
+- CI 泄露检测器误报（跳过二进制文件、自身扫描、合法系统目录常量）
+
 ## [0.1.0] - 2026-09-12
 
 ### Added
