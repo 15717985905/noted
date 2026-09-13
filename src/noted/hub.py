@@ -3,6 +3,7 @@
 # 落笔 · Noted — 本地网页服务 + 自动软链接同步 + 全文搜索 + 标签管理
 # 零依赖，macOS 自带 Python 运行
 
+import base64
 import http.server
 import os
 import json
@@ -32,7 +33,7 @@ EXCLUDE_FILES = {
 }
 
 EXCLUDE_DIRS = {
-    "gpt备份", "node_modules", ".git", "__pycache__", ".trash",
+    "gpt备份", "node_modules", ".git", "__pycache__", ".trash", "._assets_",
 }
 
 SKIP_DIRS = {
@@ -40,6 +41,7 @@ SKIP_DIRS = {
     "node_modules", "gpt备份", "__pycache__", "venv", ".venv", ".next",
     ".claude-science", ".claude", ".mirasim", ".aweskill", ".nvm",
     ".cursor", ".opencode", ".codex",
+    "._assets_",
 }
 
 REFRESH_INTERVAL = 5000
@@ -274,7 +276,9 @@ def get_ignored_paths(notes_dir: str):
     ignored = set()
     for key, entry in load_index(notes_dir).items():
         if isinstance(entry, dict) and entry.get("discover_ignored"):
-            ignored.add(entry.get("discover_path", key))
+            discover_path = entry.get("discover_path", key)
+            if isinstance(discover_path, str):
+                ignored.add(discover_path)
     return ignored
 
 
@@ -396,79 +400,302 @@ def sync_links(notes_dir: str):
     return new_links
 
 
-def _is_safe_link(url: str) -> bool:
+ASSET_DIRNAME = "._assets_"
+
+IMAGE_MIME_EXT = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+
+IMAGE_CHAR_EXTS = {"png", "jpg", "jpeg", "gif", "webp"}
+
+IMAGE_MAX_SIZE = 5 * 1024 * 1024
+
+MAX_PREVIEW_CHARS = 1000000
+
+MAX_SAVE_CHARS = 2000000
+
+MAX_IMAGE_BASE64_CHARS = int(IMAGE_MAX_SIZE * 4 / 3) + 8192
+
+MAX_UPLOAD_BODY_BYTES = 12 * 1024 * 1024
+
+DEFAULT_POST_BODY_BYTES = 1 * 1024 * 1024
+
+POST_BODY_CAPS = {
+    "/api/upload": MAX_UPLOAD_BODY_BYTES,
+    "/api/preview": MAX_UPLOAD_BODY_BYTES,
+    "/api/save": MAX_UPLOAD_BODY_BYTES,
+}
+
+ASSET_FILE_MAX_CHARS = 2048
+
+
+def is_valid_note_name(filename):
+    return (
+        isinstance(filename, str)
+        and bool(filename)
+        and "/" not in filename
+        and "\\" not in filename
+        and ".." not in filename
+        and "\0" not in filename
+        and len(filename) <= 200
+    )
+
+
+def is_note_file(filename):
+    return is_valid_note_name(filename) and filename.lower().endswith(".md")
+
+
+def is_safe_note_ref(filename):
+    return (
+        isinstance(filename, str)
+        and bool(filename)
+        and "/" not in filename
+        and "\\" not in filename
+        and ".." not in filename
+        and "\0" not in filename
+    )
+
+
+def _file_revision(path):
+    st = os.stat(path)
+    return f"{st.st_mtime_ns}:{st.st_size}"
+
+
+def _atomic_write_file(path, text):
+    directory = os.path.dirname(path) or "."
+    tmp = os.path.join(directory, f".{os.path.basename(path)}.{secrets.token_hex(8)}.tmp")
     try:
-        parsed = urllib.parse.urlparse(url)
-        scheme = (parsed.scheme or "").lower()
-        if scheme in ("javascript", "data", "vbscript"):
-            return False
-        if scheme == "" and url.startswith("//"):
-            return False
-        if scheme in ("http", "https", "mailto"):
-            return True
-        if scheme == "" and not url.startswith("//"):
-            return True
-        return False
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = 0o644
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def _image_magic_ok(raw, ext):
+    if ext == "png":
+        return raw[:8] == b"\x89PNG\r\n\x1a\n"
+    if ext in ("jpg", "jpeg"):
+        return raw[:3] == b"\xff\xd8\xff"
+    if ext == "gif":
+        return raw[:4] in (b"GIF87a", b"GIF89a")
+    if ext == "webp":
+        return len(raw) > 12 and raw[:4] == b"RIFF" and raw[8:12] == b"WEBP"
+    return False
+
+
+def _url_has_attr_risk(url):
+    if not url or len(url) > 2048:
+        return True
+    if '"' in url or "<" in url or ">" in url:
+        return True
+    return any(ord(c) < 32 for c in url)
+
+
+def _safe_link_href(url):
+    u = url.strip()
+    if _url_has_attr_risk(u):
+        return "#"
+    try:
+        parsed = urllib.parse.urlparse(u)
     except Exception:
+        return "#"
+    scheme = parsed.scheme.lower()
+    if scheme in ("http", "https", "mailto"):
+        return u
+    if scheme:
+        return "#"
+    if u.startswith("//"):
+        return "#"
+    return u
+
+
+def _image_web_url(url):
+    u = url.strip()
+    if _url_has_attr_risk(u):
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(u)
+    except Exception:
+        return ""
+    scheme = parsed.scheme.lower()
+    if scheme in ("http", "https"):
+        return u
+    if scheme:
+        return ""
+    if u.startswith("/") or u.startswith("//"):
+        return ""
+    return "/api/asset?file=" + urllib.parse.quote(u, safe="/")
+
+
+def _is_table_sep(line):
+    s = line.strip()
+    if not s or "-" not in s:
         return False
+    inner = s.strip("|")
+    cells = [c.strip() for c in inner.split("|")]
+    if not any(cells):
+        return False
+    return all(re.fullmatch(r":?-+:?", c) for c in cells)
+
+
+def _split_table_row(line):
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _inline_html(s):
+    s = re.sub(r'`([^`]+)`', lambda m: f"<code>{m.group(1)}</code>", s)
+    def img_repl(m):
+        web = _image_web_url(m.group(2))
+        if not web:
+            return m.group(1)
+        return f'<img src="{web}" alt="{m.group(1)}">'
+    s = re.sub(r'!\[([^\]]*)\]\(((?:\([^()]*\)|[^()])+)\)', img_repl, s)
+    s = re.sub(r'\*\*(.+?)\*\*', lambda m: f"<strong>{m.group(1)}</strong>", s)
+    s = re.sub(r'\*(.+?)\*', lambda m: f"<em>{m.group(1)}</em>", s)
+    s = re.sub(r'\[([^\]]+)\]\(((?:\([^()]*\)|[^()])+)\)',
+               lambda m: f'<a href="{_safe_link_href(m.group(2))}">{m.group(1)}</a>', s)
+    return s
 
 
 def simple_markdown(text):
+    if not isinstance(text, str):
+        return ""
     lines = text.split("\n")
     html = []
     in_code = False
     in_list = False
-    for line in lines:
+    list_kind = "ul"
+    in_quote = False
+    i = 0
+    n = len(lines)
+
+    def close_list():
+        nonlocal in_list
+        if in_list:
+            html.append("</" + list_kind + ">")
+            in_list = False
+
+    def close_quote():
+        nonlocal in_quote
+        if in_quote:
+            html.append("</blockquote>")
+            in_quote = False
+
+    while i < n:
+        line = lines[i]
         stripped = line.strip()
         if stripped.startswith("```"):
+            close_list()
+            close_quote()
             if in_code:
-                html.append("</pre>")
+                html.append("</code></pre>")
                 in_code = False
             else:
                 html.append("<pre><code>")
                 in_code = True
+            i += 1
             continue
         if in_code:
             html.append(escape_html(stripped))
+            i += 1
             continue
-        if stripped.startswith("# "):
-            html.append(f"<h1>{escape_html(stripped[2:])}</h1>")
-        elif stripped.startswith("## "):
-            html.append(f"<h2>{escape_html(stripped[3:])}</h2>")
-        elif stripped.startswith("### "):
-            html.append(f"<h3>{escape_html(stripped[4:])}</h3>")
-        elif stripped.startswith("- "):
+        heading = re.match(r'^(#{1,6})\s+(.*)$', stripped)
+        if heading:
+            close_list()
+            close_quote()
+            level = len(heading.group(1))
+            html.append(f"<h{level}>{escape_html(heading.group(2).strip())}</h{level}>")
+            i += 1
+            continue
+        if (("|" in stripped and i + 1 < n and _is_table_sep(lines[i + 1])
+             and not stripped.startswith(("#", ">", "-", "*", "+")))):
+            close_list()
+            close_quote()
+            header_cells = _split_table_row(stripped)
+            k = i + 2
+            body_rows = []
+            while k < n:
+                s2 = lines[k].strip()
+                if not s2 or "|" not in s2:
+                    break
+                body_rows.append(_split_table_row(lines[k]))
+                k += 1
+            out = ["<table><thead><tr>"]
+            for cell in header_cells:
+                out.append(f"<th>{_inline_html(escape_html(cell))}</th>")
+            out.append("</tr></thead>")
+            width = len(header_cells)
+            if body_rows:
+                out.append("<tbody>")
+                for row in body_rows:
+                    cells = list(row) + [""] * max(0, width - len(row))
+                    out.append("<tr>" + "".join(
+                        f"<td>{_inline_html(escape_html(c))}</td>" for c in cells[:width]
+                    ) + "</tr>")
+                out.append("</tbody>")
+            out.append("</table>")
+            html.extend(out)
+            i = k
+            continue
+        if stripped.startswith("- ") or stripped.startswith("* "):
+            close_quote()
             if not in_list:
+                list_kind = "ul"
                 html.append("<ul>")
                 in_list = True
-            html.append(f"<li>{escape_html(stripped[2:])}</li>")
-        elif stripped.startswith("* "):
+            content = escape_html(stripped[2:])
+            task = re.match(r'^\[([ xX])\]\s*(.*)$', content)
+            if task:
+                checked = " checked" if task.group(1).lower() == "x" else ""
+                checkbox = f'<input type="checkbox" disabled{checked}> '
+                html.append(f'<li class="task"><label>{checkbox}{_inline_html(task.group(2))}</label></li>')
+            else:
+                html.append(f"<li>{_inline_html(content)}</li>")
+            i += 1
+            continue
+        ordered = re.match(r'^\d+\.\s+(.*)$', stripped)
+        if ordered:
+            close_quote()
             if not in_list:
-                html.append("<ul>")
-                in_list = True
-            html.append(f"<li>{escape_html(stripped[2:])}</li>")
-        elif re.match(r'^\d+\.\s', stripped):
-            if not in_list:
+                list_kind = "ol"
                 html.append("<ol>")
                 in_list = True
-            content = re.sub(r'^\d+\.\s', '', stripped)
-            html.append(f"<li>{escape_html(content)}</li>")
-        elif stripped == "":
-            if in_list:
-                html.append("</ul>" if html[-1].startswith("<ul>") else "</ol>")
-                in_list = False
-            html.append("<br>")
-        else:
-            if in_list:
-                html.append("</ul>" if html[-1].startswith("<ul>") else "</ol>")
-                in_list = False
-            bold = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', escape_html(stripped))
-            italic = re.sub(r'\*(.+?)\*', r'<em>\1</em>', bold)
-            link = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', italic)
-            link = re.sub(r'href="([^"]+)"', lambda m: f'href="{m.group(1)}"' if _is_safe_link(m.group(1)) else 'href="#"', link)
-            html.append(f"<p>{link}</p>")
-    if in_list:
-        html.append("</ul>" if html[-1].startswith("<ul>") else "</ol>")
+            html.append(f"<li>{_inline_html(escape_html(ordered.group(1)))}</li>")
+            i += 1
+            continue
+        if stripped == ">" or stripped.startswith("> "):
+            close_list()
+            if not in_quote:
+                html.append("<blockquote>")
+                in_quote = True
+            quote_text = stripped[1:].lstrip()
+            html.append(f"<p>{_inline_html(escape_html(quote_text))}</p>")
+            i += 1
+            continue
+        close_list()
+        close_quote()
+        if not stripped:
+            i += 1
+            continue
+        html.append(f"<p>{_inline_html(escape_html(stripped))}</p>")
+        i += 1
+    if in_code:
+        html.append("</code></pre>")
+    close_list()
+    close_quote()
     return "\n".join(html)
 
 
@@ -640,8 +867,44 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_detail(filename)
         elif path == "/api/groups":
             self.send_groups()
+        elif path == "/api/edit":
+            qs = urllib.parse.parse_qs(parsed.query)
+            self.send_edit(qs.get("file", [""])[0])
+        elif path == "/api/asset":
+            qs = urllib.parse.parse_qs(parsed.query)
+            self.send_asset(qs.get("file", [""])[0])
         else:
             self.send_error(404)
+
+    def _read_json_body(self, limit):
+        val = self.headers.get("Content-Length")
+        if val is None:
+            length = 0
+        else:
+            token = val.strip()
+            if not re.fullmatch(r"[0-9]{1,10}", token):
+                self.close_connection = True
+                self.send_error(400)
+                return None
+            length = int(token)
+            if length > limit:
+                self.close_connection = True
+                self.send_error(400)
+                return None
+        if length == 0:
+            body = b""
+        else:
+            body = self.rfile.read(length)
+            self.close_connection = True
+        try:
+            data = json.loads(body.decode("utf-8"))
+        except Exception:
+            self.send_error(400)
+            return None
+        if not isinstance(data, dict):
+            self.send_error(400)
+            return None
+        return data
 
     def do_POST(self):
         if not validate_host(self):
@@ -652,12 +915,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
-        try:
-            data = json.loads(body.decode("utf-8"))
-        except Exception:
-            self.send_error(400)
+        data = self._read_json_body(POST_BODY_CAPS.get(path, DEFAULT_POST_BODY_BYTES))
+        if data is None:
             return
         if path == "/api/tags":
             self.send_tags(data)
@@ -689,6 +948,12 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.send_group_disband(data)
         elif path == "/api/group/toggle":
             self.send_group_toggle(data)
+        elif path == "/api/preview":
+            self.send_preview(data)
+        elif path == "/api/save":
+            self.send_save(data)
+        elif path == "/api/upload":
+            self.send_upload(data)
         else:
             self.send_error(404)
 
@@ -709,7 +974,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def _get_index_entry(self, notes_dir: str, filename):
         index = load_index(notes_dir)
-        return index.get(filename, {})
+        entry = index.get(filename, {})
+        return entry if isinstance(entry, dict) else {}
 
     def _parse_note(self, notes_dir: str, filename, path, full_content=False):
         try:
@@ -740,10 +1006,15 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 content = "".join(lines)
 
             idx = self._get_index_entry(notes_dir, filename)
-            if idx.get("tags"):
-                tags = idx["tags"]
-            starred = idx.get("starred", False)
+            raw_tags = idx.get("tags")
+            if isinstance(raw_tags, list):
+                tags = [t for t in raw_tags if isinstance(t, str)]
+            else:
+                tags = []
+            starred = idx.get("starred") is True
             note = idx.get("note", "")
+            if not isinstance(note, str):
+                note = ""
 
             is_symlink = os.path.islink(path)
             source = ""
@@ -816,7 +1087,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.send_json(results)
 
     def send_read(self, filename):
-        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        if not is_safe_note_ref(filename):
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -833,7 +1104,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(content.encode("utf-8"))
 
     def send_read_html(self, filename):
-        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        if not is_safe_note_ref(filename):
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -850,6 +1121,216 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html.encode("utf-8"))
 
+    def send_edit(self, filename):
+        if not is_note_file(filename):
+            self.send_error(400)
+            return
+        notes_dir = get_notes_dir()
+        path = os.path.join(notes_dir, filename)
+        if not os.path.isfile(path):
+            self.send_error(404)
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception:
+            self.send_error(404)
+            return
+        is_symlink = os.path.islink(path)
+        source_label = ""
+        if is_symlink:
+            try:
+                real = os.path.realpath(path)
+                source_label = os.path.basename(os.path.dirname(real)) or "notes"
+            except Exception:
+                source_label = "notes"
+        self.send_json({
+            "file": filename,
+            "content": content,
+            "revision": _file_revision(path),
+            "is_symlink": is_symlink,
+            "source_label": source_label,
+        })
+
+    def send_preview(self, data):
+        content = data.get("content")
+        if not isinstance(content, str):
+            self.send_error(400)
+            return
+        if len(content) > MAX_PREVIEW_CHARS:
+            self.send_error(400)
+            return
+        self.send_json({"ok": True, "html": simple_markdown(content)})
+
+    def send_save(self, data):
+        filename = data.get("file")
+        content = data.get("content")
+        revision = data.get("revision")
+        if not isinstance(filename, str) or not isinstance(content, str) or not isinstance(revision, str):
+            self.send_error(400)
+            return
+        if not is_note_file(filename):
+            self.send_error(400)
+            return
+        if len(content) > MAX_SAVE_CHARS:
+            self.send_json({"ok": False, "error": "内容过长"})
+            return
+        notes_dir = get_notes_dir()
+        path = os.path.join(notes_dir, filename)
+        if not os.path.isfile(path):
+            self.send_error(404)
+            return
+        is_symlink = os.path.islink(path)
+        current_revision = _file_revision(path)
+        if revision != current_revision:
+            self.send_json({"ok": False, "conflict": True, "revision": current_revision})
+            return
+        propagate = data.get("propagate") is True
+        write_path = path
+        if is_symlink:
+            if not propagate:
+                self.send_json({"ok": False, "symlink": True, "requires_propagate": True})
+                return
+            write_path = os.path.realpath(path)
+            if not os.path.isfile(write_path):
+                self.send_error(404)
+                return
+            linked = []
+            for f in os.listdir(notes_dir):
+                p = os.path.join(notes_dir, f)
+                if f != filename and f.endswith(".md") and os.path.islink(p):
+                    try:
+                        linked.append(os.path.realpath(p))
+                    except Exception:
+                        pass
+            if write_path in linked:
+                self.send_json({"ok": False, "symlink": True, "error": "有多个链接指向同一源文件，无法安全写入"})
+                return
+        try:
+            _atomic_write_file(write_path, content)
+        except Exception as e:
+            self.send_json({"ok": False, "error": f"保存失败: {e}"})
+            return
+        try:
+            new_revision = _file_revision(write_path)
+        except Exception:
+            new_revision = revision
+        self.send_json({"ok": True, "revision": new_revision, "propagated": is_symlink and propagate})
+
+    def send_upload(self, data):
+        filename = data.get("file")
+        name = data.get("filename")
+        mime = data.get("mime")
+        payload = data.get("data")
+        if not is_note_file(filename):
+            self.send_error(400)
+            return
+        notes_dir = get_notes_dir()
+        path = os.path.join(notes_dir, filename)
+        if not os.path.isfile(path):
+            self.send_error(404)
+            return
+        if not isinstance(payload, str) or not payload:
+            self.send_json({"ok": False, "error": "data 必须为 base64 字符串"})
+            return
+        if not isinstance(mime, str) or not mime:
+            self.send_json({"ok": False, "error": "mime 必须为字符串"})
+            return
+        mime_norm = mime.strip().lower()
+        target_ext = None
+        for m, ext in IMAGE_MIME_EXT.items():
+            if mime_norm == m or (m == "image/jpeg" and mime_norm in ("image/jpg", "jpg", "jpeg")):
+                target_ext = ext
+        if not target_ext:
+            self.send_json({"ok": False, "error": "不支持的图片类型"})
+            return
+        if isinstance(name, str) and name:
+            dotted = os.path.splitext(name)[1].lstrip(".").lower()
+            if dotted and dotted not in IMAGE_CHAR_EXTS:
+                self.send_json({"ok": False, "error": "文件扩展名不符合图片类型"})
+                return
+        if len(payload) > MAX_IMAGE_BASE64_CHARS:
+            self.send_json({"ok": False, "error": "图片数据超限"})
+            return
+        try:
+            raw = base64.b64decode(payload, validate=True)
+        except Exception:
+            self.send_json({"ok": False, "error": "图片数据无效"})
+            return
+        if not raw:
+            self.send_json({"ok": False, "error": "图片为空"})
+            return
+        if len(raw) > IMAGE_MAX_SIZE:
+            self.send_json({"ok": False, "error": "图片大小超限"})
+            return
+        if not _image_magic_ok(raw, target_ext):
+            self.send_json({"ok": False, "error": "文件内容与类型不符"})
+            return
+        stem = filename[: -len(".md")] if filename.lower().endswith(".md") else filename
+        asset_dir = os.path.join(notes_dir, ASSET_DIRNAME, stem)
+        new_name = f"{secrets.token_hex(10)}.{target_ext}"
+        target_path = os.path.join(asset_dir, new_name)
+        tmp_path = os.path.join(asset_dir, f".{new_name}.{secrets.token_hex(4)}.tmp")
+        try:
+            os.makedirs(asset_dir, exist_ok=True)
+            with open(tmp_path, "wb") as f:
+                f.write(raw)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp_path, 0o644)
+            os.replace(tmp_path, target_path)
+        except Exception as e:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            self.send_json({"ok": False, "error": f"保存图片失败: {e}"})
+            return
+        url = f"{stem}/{new_name}"
+        self.send_json({"ok": True, "url": url, "name": new_name})
+
+    ASSET_EXT_MIME = {
+        "png": "image/png",
+        "jpg": "image/jpeg",
+        "jpeg": "image/jpeg",
+        "gif": "image/gif",
+        "webp": "image/webp",
+    }
+
+    def send_asset(self, name):
+        if not isinstance(name, str):
+            self.send_error(400)
+            return
+        name = name.strip()
+        if not name or len(name) > ASSET_FILE_MAX_CHARS or "\0" in name:
+            self.send_error(400)
+            return
+        if name.startswith("/") or any(part in ("", ".", "..") for part in name.replace("\\", "/").split("/")):
+            self.send_error(400)
+            return
+        base_dir = os.path.realpath(os.path.join(get_notes_dir(), ASSET_DIRNAME))
+        target = os.path.realpath(os.path.join(base_dir, name))
+        if not target.startswith(base_dir + os.sep):
+            self.send_error(400)
+            return
+        ext = os.path.splitext(target)[1].lstrip(".").lower()
+        content_type = self.ASSET_EXT_MIME.get(ext)
+        if not content_type:
+            self.send_error(404)
+            return
+        if not os.path.isfile(target):
+            self.send_error(404)
+            return
+        with open(target, "rb") as f:
+            payload = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_security_headers()
+        self.end_headers()
+        self.wfile.write(payload)
+
     def send_sync(self):
         notes_dir = get_notes_dir()
         new_links = sync_links(notes_dir)
@@ -860,8 +1341,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         ignored = set()
         index = load_index(notes_dir)
         for key, entry in index.items():
-            if entry.get("discover_ignored"):
-                ignored.add(entry.get("discover_path", key))
+            if isinstance(entry, dict) and entry.get("discover_ignored"):
+                discover_path = entry.get("discover_path", key)
+                if isinstance(discover_path, str):
+                    ignored.add(discover_path)
 
         _cleanup_discover_tokens()
 
@@ -920,7 +1403,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def send_discover_ignore(self, data):
         candidate_id = data.get("candidate_id", "")
-        if not candidate_id:
+        if not isinstance(candidate_id, str) or not candidate_id:
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -940,7 +1423,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def send_discover_add(self, data):
         candidate_id = data.get("candidate_id", "")
-        if not candidate_id:
+        if not isinstance(candidate_id, str) or not candidate_id:
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -971,16 +1454,22 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         index = load_index(notes_dir)
         views = {}
         for _, entry in index.items():
-            if entry.get("view") and entry.get("name"):
-                views[entry["name"]] = {
-                    "name": entry["name"],
-                    "filters": entry.get("filters", {}),
-                    "updated_at": entry.get("updated_at", ""),
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if entry.get("view") and isinstance(name, str) and name:
+                filters = entry.get("filters", {})
+                if not isinstance(filters, dict):
+                    filters = {}
+                views[name] = {
+                    "name": name,
+                    "filters": filters,
+                    "updated_at": entry.get("updated_at", "") if isinstance(entry.get("updated_at"), str) else "",
                 }
         self.send_json(views)
 
     def send_detail(self, filename):
-        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        if not is_safe_note_ref(filename):
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -1015,7 +1504,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def send_reveal(self, data):
         filename = data.get("file", "")
-        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        if not is_safe_note_ref(filename):
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -1035,7 +1524,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def send_open(self, data):
         filename = data.get("file", "")
-        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        if not is_safe_note_ref(filename):
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -1326,7 +1815,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def send_tags(self, data):
         filename = data.get("file", "")
         tags = data.get("tags", [])
-        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        if not is_safe_note_ref(filename):
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -1334,10 +1823,11 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not os.path.isfile(path):
             self.send_error(404)
             return
+        safe_tags = [t for t in tags if isinstance(t, str)] if isinstance(tags, list) else []
         index = load_index(notes_dir)
         if filename not in index:
             index[filename] = {}
-        index[filename]["tags"] = tags
+        index[filename]["tags"] = safe_tags
         index[filename]["updated_at"] = datetime.now().isoformat()
         save_index(notes_dir, index)
         self.send_json({"ok": True})
@@ -1345,7 +1835,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def send_star(self, data):
         filename = data.get("file", "")
         starred = data.get("starred", False)
-        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        if not is_safe_note_ref(filename):
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -1356,14 +1846,14 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         index = load_index(notes_dir)
         if filename not in index:
             index[filename] = {}
-        index[filename]["starred"] = starred
+        index[filename]["starred"] = starred is True
         index[filename]["updated_at"] = datetime.now().isoformat()
         save_index(notes_dir, index)
         self.send_json({"ok": True})
 
     def send_delete(self, data):
         filename = data.get("file", "")
-        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        if not is_safe_note_ref(filename):
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -1401,10 +1891,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         update_h1 = bool(data.get("update_h1", False))
         propagate = bool(data.get("propagate", False))
 
-        if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        if not isinstance(filename, str):
             self.send_error(400)
             return
-        if not new_name:
+        if not is_safe_note_ref(filename):
+            self.send_error(400)
+            return
+        if not isinstance(new_name, str) or not new_name:
             self.send_error(400)
             return
 
@@ -1544,7 +2037,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def send_save_view(self, data):
         name = data.get("name", "")
         filters = data.get("filters", {})
+        if not isinstance(name, str):
+            self.send_error(400)
+            return
         if not name or len(name) > 64 or any(c in name for c in "\\/:\0"):
+            self.send_error(400)
+            return
+        if not isinstance(filters, dict):
             self.send_error(400)
             return
         notes_dir = get_notes_dir()
@@ -2160,6 +2659,146 @@ HTML = """<!DOCTYPE html>
   .add-to-group-select label:hover {
     background: #f5f5f7;
   }
+  .editor-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+  .editor-toolbar .btn {
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+  .editor-panes {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .editor-pane-edit, .editor-pane-preview { min-width: 0; }
+  #editor-text {
+    width: 100%;
+    min-height: 420px;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    border: 1px solid #d2d2d7;
+    border-radius: 8px;
+    padding: 12px;
+    resize: vertical;
+    background: #fff;
+    color: #1d1d1f;
+    outline: none;
+  }
+  #editor-text:focus { border-color: #007aff; }
+  #editor-preview {
+    background: #f5f5f7;
+    border-radius: 8px;
+    padding: 16px;
+    min-height: 420px;
+    max-height: 70vh;
+    overflow: auto;
+    font-size: 14px;
+    line-height: 1.7;
+  }
+  #editor-preview h1, #editor-preview h2 { margin-top: 20px; margin-bottom: 10px; }
+  #editor-preview h3, #editor-preview h4, #editor-preview h5, #editor-preview h6 { margin-top: 16px; margin-bottom: 8px; }
+  #editor-preview p { margin: 10px 0; }
+  #editor-preview pre {
+    background: #fff;
+    padding: 12px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 13px;
+  }
+  #editor-preview code {
+    background: #e5e5e5;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 13px;
+    font-family: "SF Mono", monospace;
+  }
+  #editor-preview pre code { background: none; padding: 0; }
+  #editor-preview blockquote {
+    border-left: 3px solid #007aff;
+    padding-left: 14px;
+    margin: 12px 0;
+    color: #515154;
+  }
+  #editor-preview ul, #editor-preview ol { margin: 10px 0; padding-left: 22px; }
+  #editor-preview li { margin: 3px 0; }
+  #editor-preview li.task { list-style: none; margin-left: -20px; }
+  #editor-preview li.task label { cursor: default; }
+  #editor-preview input[type="checkbox"] { margin-right: 6px; }
+  #editor-preview table {
+    border-collapse: collapse;
+    margin: 12px 0;
+    width: 100%;
+    font-size: 14px;
+  }
+  #editor-preview th, #editor-preview td {
+    border: 1px solid #d2d2d7;
+    padding: 6px 10px;
+    text-align: left;
+  }
+  #editor-preview th { background: #fff; }
+  #editor-preview img { max-width: 100%; border-radius: 8px; }
+  .editor-status-bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 10px;
+    flex-wrap: wrap;
+  }
+  #editor-save-state {
+    font-size: 12px;
+    color: #86868b;
+    flex: 1;
+  }
+  #editor-save-state.dirty { color: #ff9500; }
+  #editor-save-state.saved { color: #34c759; }
+  #editor-save-state.error { color: #ff3b30; }
+  .editor-conflict {
+    display: none;
+    background: #fff8e1;
+    border: 1px solid #f0c040;
+    color: #7a5b00;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 13px;
+    margin-top: 10px;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .editor-conflict.show { display: flex; }
+  .editor-meta-note {
+    font-size: 12px;
+    color: #ff9500;
+    background: #fff8e1;
+    border-radius: 8px;
+    padding: 8px 12px;
+    margin: 8px 0;
+  }
+  #editor-mode {
+    display: none;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+  #editor-mode .btn.active {
+    background: #007aff;
+    color: #fff;
+    border-color: #007aff;
+  }
+  @media (max-width: 768px) {
+    .editor-panes { grid-template-columns: 1fr; }
+    #editor-text { min-height: 50vh; }
+    #editor-preview { min-height: auto; max-height: 60vh; }
+    #editor-mode { display: flex; }
+    .editor-pane-preview { display: none; }
+    .editor-pane-preview.active { display: block; }
+    .editor-pane-edit { display: block; }
+    .editor-pane-edit.inactive { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -2220,6 +2859,7 @@ HTML = """<!DOCTYPE html>
     <div id="reader" class="reader" data-file="">
       <span class="reader-back" data-action="showList">← 返回列表</span>
       <button class="btn" data-action="renameReaderNote" id="reader-rename-btn" style="display:none;margin-left:8px;">重命名</button>
+      <button class="btn btn-primary" data-action="editNote" id="reader-edit-btn" style="display:none;margin-left:8px;">编辑</button>
       <div id="reader-meta" style="display:none;padding:8px 12px;background:#f5f5f7;border-radius:8px;margin:8px 0;font-size:13px;">
         <span id="reader-kind" style="display:inline-block;padding:2px 8px;border-radius:4px;background:#e5e5e5;margin-right:8px;"></span>
         <span id="reader-path" style="font-family:monospace;color:#86868b;word-break:break-all;"></span>
@@ -2232,6 +2872,52 @@ HTML = """<!DOCTYPE html>
       <div class="related-section" id="related-section" style="display:none;">
         <div class="related-title">相关笔记</div>
         <div id="related-list"></div>
+      </div>
+    </div>
+    <div id="editor" class="reader" style="display:none;">
+      <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;">
+        <span class="reader-back" data-edit="back">← 返回</span>
+        <span id="editor-title" style="font-size:18px;font-weight:700;"></span>
+      </div>
+      <div id="editor-meta" style="display:none;padding:8px 12px;background:#f5f5f7;border-radius:8px;margin:8px 0;font-size:13px;">
+        <span id="editor-kind" style="display:inline-block;padding:2px 8px;border-radius:4px;background:#e5e5e5;margin-right:8px;"></span>
+        <span id="editor-propagate-row" style="display:none;color:#ff9500;">保存会修改源文件，继续前将请求确认</span>
+      </div>
+      <div id="editor-mode">
+        <button class="btn active" data-edit="mode-edit">编辑</button>
+        <button class="btn" data-edit="mode-preview">预览</button>
+      </div>
+      <div class="editor-toolbar" id="editor-toolbar">
+        <button class="btn" data-edit="heading">H</button>
+        <button class="btn" data-edit="bold" style="font-weight:700;">B</button>
+        <button class="btn" data-edit="italic" style="font-style:italic;">I</button>
+        <button class="btn" data-edit="link">链接</button>
+        <button class="btn" data-edit="quote">引用</button>
+        <button class="btn" data-edit="codeblock">代码块</button>
+        <button class="btn" data-edit="ul">列表</button>
+        <button class="btn" data-edit="task">任务</button>
+        <button class="btn" data-edit="table">表格</button>
+        <button class="btn" data-edit="image">图片</button>
+        <input type="file" id="editor-image-input" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none;" />
+      </div>
+      <div class="editor-conflict" id="editor-conflict">
+        <span>文件已被外部修改，继续保存将覆盖最新内容</span>
+        <button class="btn btn-primary" data-edit="reload">重新加载</button>
+        <button class="btn btn-danger" data-edit="overwrite">强制覆盖</button>
+        <button class="btn" data-edit="close-conflict">关闭</button>
+      </div>
+      <div class="editor-panes" id="editor-panes">
+        <div class="editor-pane-edit" id="editor-pane-edit">
+          <textarea id="editor-text" wrap="soft" placeholder="# 开始写 Markdown…"></textarea>
+        </div>
+        <div class="editor-pane-preview active" id="editor-pane-preview">
+          <div id="editor-preview" class="reader-body"></div>
+        </div>
+      </div>
+      <div class="editor-status-bar">
+        <span id="editor-save-state">未保存</span>
+        <button class="btn" data-edit="cancel">取消</button>
+        <button class="btn btn-primary" data-edit="save">保存</button>
       </div>
     </div>
     <div id="empty" class="empty" style="display:none;">
@@ -2764,6 +3450,7 @@ HTML = """<!DOCTYPE html>
     }
 
     async function openNote(file) {
+      if (!closeEditorIfDirty()) return;
       try {
         const res = await fetch('/api/read/html?file=' + encodeURIComponent(file));
         const html = await res.text();
@@ -2771,9 +3458,12 @@ HTML = """<!DOCTYPE html>
         document.getElementById('note-list').style.display = 'none';
         document.getElementById('empty').style.display = 'none';
         document.getElementById('discover-panel').style.display = 'none';
+        document.getElementById('editor').style.display = 'none';
+        editorOpen = false;
         document.getElementById('reader').style.display = 'block';
         document.getElementById('reader').dataset.file = file;
         document.getElementById('reader-rename-btn').style.display = 'inline-block';
+        document.getElementById('reader-edit-btn').style.display = 'inline-block';
         window.scrollTo(0, 0);
         renderRelatedNotes(file);
         loadReaderDetail(file);
@@ -2899,6 +3589,7 @@ HTML = """<!DOCTYPE html>
       };
     }
     function showList() {
+      if (!closeEditorIfDirty()) return;
       document.getElementById('reader').style.display = 'none';
       document.getElementById('note-list').style.display = 'block';
     }
@@ -3236,6 +3927,392 @@ HTML = """<!DOCTYPE html>
         document.getElementById('discover-empty').style.display = 'block';
       }
     }
+    let editorOpen = false;
+    let editorFile = '';
+    let editorRevision = '';
+    let editorDirty = false;
+    let editorSymlink = false;
+    let editorConflictRevision = '';
+    let previewSeq = 0;
+    let previewTimer = null;
+    const EDITOR_IMG_TYPES = {'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp'};
+
+    function editorTa() {
+      return document.getElementById('editor-text');
+    }
+    function setEditorSaveState(cls, text) {
+      const el = document.getElementById('editor-save-state');
+      el.className = cls || '';
+      el.textContent = text;
+    }
+    function markEditorDirty(dirty) {
+      editorDirty = dirty;
+      if (dirty) setEditorSaveState('dirty', '有未保存的更改');
+      else setEditorSaveState('saved', '已保存');
+    }
+    function hideEditorConflict() {
+      document.getElementById('editor-conflict').classList.remove('show');
+      editorConflictRevision = '';
+    }
+    function closeEditorIfDirty() {
+      if (!editorOpen) return true;
+      if (editorDirty && !confirm('当前笔记有未保存的更改，离开将放弃这些更改。确定离开？')) {
+        return false;
+      }
+      closeEditorSilent();
+      return true;
+    }
+    function closeEditorSilent() {
+      if (!editorOpen) return;
+      editorOpen = false;
+      if (previewTimer) {
+        clearTimeout(previewTimer);
+        previewTimer = null;
+      }
+      previewSeq++;
+      document.getElementById('editor').style.display = 'none';
+      hideEditorConflict();
+      document.getElementById('editor-text').value = '';
+      document.getElementById('editor-preview').innerHTML = '';
+    }
+    function exitToBack() {
+      if (!closeEditorIfDirty()) return;
+      showList();
+    }
+    async function openEditor(file) {
+      if (editorOpen && editorDirty && !confirm('当前笔记有未保存更改，打开其他笔记将放弃这些更改')) {
+        return;
+      }
+      const res = await fetch('/api/edit?file=' + encodeURIComponent(file));
+      if (!res.ok) {
+        alert('打开编辑失败');
+        return;
+      }
+      const data = await res.json();
+      closeEditorSilent();
+      editorFile = file;
+      editorRevision = data.revision || '';
+      editorSymlink = !!data.is_symlink;
+      editorConflictRevision = '';
+      editorTa().value = data.content || '';
+      editorTa().focus();
+      document.getElementById('editor-title').textContent = data.file;
+      const meta = document.getElementById('editor-meta');
+      meta.style.display = 'block';
+      const kind = document.getElementById('editor-kind');
+      kind.textContent = editorSymlink ? '软链接 · ' + (data.source_label || '未知来源') : '本地文件';
+      kind.style.background = editorSymlink ? '#ff9500' : '#e5e5e5';
+      kind.style.color = editorSymlink ? '#fff' : '#1d1d1f';
+      document.getElementById('editor-propagate-row').style.display = editorSymlink ? 'inline' : 'none';
+      document.getElementById('reader').style.display = 'none';
+      document.getElementById('note-list').style.display = 'none';
+      document.getElementById('empty').style.display = 'none';
+      document.getElementById('discover-panel').style.display = 'none';
+      document.getElementById('editor').style.display = 'block';
+      editorOpen = true;
+      markEditorDirty(false);
+      setEditorSaveState('', '已加载');
+      const isMobile = window.matchMedia && window.matchMedia('(max-width: 768px)').matches;
+      setEditorMode(isMobile ? 'edit' : 'both');
+      requestPreview();
+      window.scrollTo(0, 0);
+    }
+    function setEditorMode(mode) {
+      const editPane = document.getElementById('editor-pane-edit');
+      const previewPane = document.getElementById('editor-pane-preview');
+      document.querySelectorAll('#editor-mode .btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.edit === 'mode-' + mode);
+      });
+      if (mode === 'edit') {
+        editPane.classList.remove('inactive');
+        previewPane.classList.remove('active');
+      } else if (mode === 'preview') {
+        editPane.classList.add('inactive');
+        previewPane.classList.add('active');
+        requestPreview();
+      } else {
+        editPane.classList.remove('inactive');
+        previewPane.classList.add('active');
+      }
+    }
+    function schedulePreview() {
+      if (previewTimer) {
+        clearTimeout(previewTimer);
+        previewTimer = null;
+      }
+      previewTimer = setTimeout(requestPreview, 400);
+    }
+    async function requestPreview() {
+      const text = editorTa().value;
+      const seq = ++previewSeq;
+      try {
+        const res = await fetch('/api/preview', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({content: text}),
+        });
+        const data = await res.json();
+        if (seq !== previewSeq) return;
+        document.getElementById('editor-preview').innerHTML = data.ok ? (data.html || '') : '';
+      } catch (e) {
+        if (seq === previewSeq) document.getElementById('editor-preview').textContent = '预览失败';
+      }
+    }
+    function applySaveSuccess(data) {
+      editorRevision = data.revision || '';
+      hideEditorConflict();
+      markEditorDirty(false);
+      setEditorSaveState('saved', '已保存 ' + new Date().toLocaleTimeString());
+      loadList();
+    }
+    async function saveEditor(propagateConfirmed) {
+      if (!editorOpen) return;
+      if (editorSymlink && propagateConfirmed !== true) {
+        const srcText = document.getElementById('editor-kind').textContent;
+        showModal('确认写入源文件', '「' + srcText + '」为软链接，保存将直接修改源文件内容。是否继续？', [
+          {text: '取消', class: 'btn', action: closeModal},
+          {text: '继续保存', class: 'btn btn-primary', action: async function() {
+            closeModal();
+            await saveEditor(true);
+          }},
+        ]);
+        return;
+      }
+      const text = editorTa().value;
+      const propagate = editorSymlink && propagateConfirmed === true;
+      const revision = editorConflictRevision || editorRevision;
+      try {
+        const res = await fetch('/api/save', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({file: editorFile, content: text, revision: revision, propagate: propagate}),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          if (data.conflict) {
+            editorConflictRevision = data.revision || '';
+            document.getElementById('editor-conflict').classList.add('show');
+            setEditorSaveState('error', '保存冲突：文件已被外部修改');
+            return;
+          }
+          setEditorSaveState('error', data.error || '保存失败');
+          return;
+        }
+        applySaveSuccess(data);
+      } catch (e) {
+        setEditorSaveState('error', '保存失败：网络错误');
+      }
+    }
+    function cancelEdit() {
+      if (!editorDirty) {
+        doCancelEdit();
+        return;
+      }
+      showModal('放弃更改', '存在未保存的更改，放弃后无法恢复。', [
+        {text: '继续编辑', class: 'btn', action: closeModal},
+        {text: '放弃', class: 'btn btn-danger', action: doCancelEdit},
+      ]);
+    }
+    function doCancelEdit() {
+      const file = editorFile;
+      closeModal();
+      closeEditorSilent();
+      if (file) openNote(file);
+      else showList();
+    }
+    function commitEditorEdit() {
+      markEditorDirty(true);
+      schedulePreview();
+    }
+    function wrapSelection(pre, post) {
+      const ta = editorTa();
+      const s = ta.selectionStart;
+      const e = ta.selectionEnd;
+      const sel = ta.value.slice(s, e);
+      ta.value = ta.value.slice(0, s) + pre + sel + post + ta.value.slice(e);
+      ta.selectionStart = s + pre.length;
+      ta.selectionEnd = s + pre.length + sel.length;
+      ta.focus();
+      commitEditorEdit();
+    }
+    function toggleLinePrefix(prefix) {
+      const ta = editorTa();
+      const v = ta.value;
+      const s = ta.selectionStart;
+      const e = ta.selectionEnd;
+      const ls = v.lastIndexOf('\\n', s - 1) + 1;
+      let le = v.indexOf('\\n', e);
+      if (le === -1) le = v.length;
+      const lines = v.slice(ls, le).split('\\n');
+      const all = lines.every(l => l.startsWith(prefix));
+      const updated = lines.map(l => all ? l.slice(prefix.length) : (l.startsWith(prefix) ? l : prefix + l)).join('\\n');
+      ta.value = v.slice(0, ls) + updated + v.slice(le);
+      ta.selectionStart = ls;
+      ta.selectionEnd = ls + updated.length;
+      ta.focus();
+      commitEditorEdit();
+    }
+    function insertLink() {
+      const ta = editorTa();
+      const s = ta.selectionStart;
+      const e = ta.selectionEnd;
+      const sel = ta.value.slice(s, e);
+      if (sel) {
+        ta.value = ta.value.slice(0, s) + '[' + sel + '](https://)' + ta.value.slice(e);
+        ta.selectionStart = s + sel.length + 3;
+        ta.selectionEnd = ta.selectionStart + 8;
+      } else {
+        ta.value = ta.value.slice(0, s) + '[链接](https://)' + ta.value.slice(e);
+        ta.selectionStart = s + 1;
+        ta.selectionEnd = s + 4;
+      }
+      ta.focus();
+      commitEditorEdit();
+    }
+    function toggleCodeBlock() {
+      const ta = editorTa();
+      const s = ta.selectionStart;
+      const e = ta.selectionEnd;
+      const sel = ta.value.slice(s, e);
+      if (!sel) {
+        const pre = (s > 0 && ta.value[s - 1] !== '\\n') ? '\\n' : '';
+        const t = pre + '```\\n\\n```\\n';
+        ta.value = ta.value.slice(0, s) + t + ta.value.slice(e);
+        ta.selectionStart = s + pre.length + 4;
+        ta.selectionEnd = ta.selectionStart;
+      } else {
+        const pre = (s > 0 && ta.value[s - 1] !== '\\n') ? '\\n' : '';
+        const post = ta.value.slice(e) && ta.value[e] !== '\\n' ? '\\n' : '';
+        const t = pre + '```\\n' + sel + '\\n```' + post;
+        ta.value = ta.value.slice(0, s) + t + ta.value.slice(e);
+        ta.selectionStart = s + t.length;
+        ta.selectionEnd = s + t.length;
+      }
+      ta.focus();
+      commitEditorEdit();
+    }
+    function insertBlock(block) {
+      const ta = editorTa();
+      const s = ta.selectionStart;
+      const e = ta.selectionEnd;
+      const pre = (s > 0 && ta.value[s - 1] !== '\\n') ? '\\n' : '';
+      const t = pre + block;
+      ta.value = ta.value.slice(0, s) + t + ta.value.slice(e);
+      ta.selectionStart = s + t.length;
+      ta.selectionEnd = s + t.length;
+      ta.focus();
+      commitEditorEdit();
+    }
+    const EDITOR_TOOLBAR = {
+      heading: function() { toggleLinePrefix('## '); },
+      bold: function() { wrapSelection('**', '**'); },
+      italic: function() { wrapSelection('*', '*'); },
+      link: function() { insertLink(); },
+      quote: function() { toggleLinePrefix('> '); },
+      codeblock: function() { toggleCodeBlock(); },
+      ul: function() { toggleLinePrefix('- '); },
+      task: function() { toggleLinePrefix('- [ ] '); },
+      table: function() { insertBlock('| 列一 | 列二 | 列三 |\\n| --- | --- | --- |\\n|  |  |  |'); },
+      image: function() { document.getElementById('editor-image-input').click(); },
+    };
+    async function uploadAndInsertImage(file) {
+      if (!file || !editorOpen) return;
+      const mimeOk = !!EDITOR_IMG_TYPES[file.type];
+      const fileName = String(file.name || '');
+      const dot = fileName.lastIndexOf('.');
+      const ext = dot >= 0 ? fileName.slice(dot + 1).toLowerCase() : '';
+      const extMimes = {'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'gif': 'image/gif', 'webp': 'image/webp'};
+      const mime = mimeOk ? file.type : (extMimes[ext] || '');
+      if (!mime) {
+        setEditorSaveState('error', '不支持的图片类型：' + (fileName || '未命名'));
+        return;
+      }
+      var dataUrl = '';
+      try {
+        dataUrl = await new Promise(function(resolve) {
+          const reader = new FileReader();
+          reader.onload = function() { resolve(reader.result); };
+          reader.onerror = function() { resolve(''); };
+          reader.readAsDataURL(file);
+        });
+      } catch (e) {
+        dataUrl = '';
+      }
+      if (!dataUrl || dataUrl.indexOf('base64,') === -1) {
+        setEditorSaveState('error', '读取图片失败');
+        return;
+      }
+      const b64 = dataUrl.split('base64,')[1];
+      try {
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({file: editorFile, data: b64, mime: mime, filename: file.name || ''}),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          setEditorSaveState('error', '图片上传失败：' + (data.error || '未知错误'));
+          return;
+        }
+        const alt = fileName.split('[').join('').split(']').join('').split('(').join('').split(')').join('').trim() || '图片';
+        insertBlock('![' + alt + '](' + data.url + ')');
+        requestPreview();
+      } catch (e) {
+        setEditorSaveState('error', '图片上传失败：网络错误');
+      }
+    }
+    document.getElementById('editor-text').addEventListener('input', () => {
+      commitEditorEdit();
+    });
+    document.getElementById('editor-text').addEventListener('paste', e => {
+      const items = e.clipboardData && e.clipboardData.items ? e.clipboardData.items : [];
+      const files = [];
+      for (const item of items) {
+        if (item.kind === 'file') {
+          const f = item.getAsFile();
+          if (f) files.push(f);
+        }
+      }
+      if (!files.length) return;
+      e.preventDefault();
+      files.forEach(f => uploadAndInsertImage(f));
+    });
+    document.getElementById('editor').addEventListener('click', e => {
+      const btn = e.target.closest('[data-edit]');
+      if (!btn) return;
+      const action = btn.dataset.edit;
+      if (action === 'back') exitToBack();
+      else if (action === 'save') saveEditor();
+      else if (action === 'cancel') cancelEdit();
+      else if (action === 'reload') { if (editorFile) openEditor(editorFile); }
+      else if (action === 'overwrite') saveEditor();
+      else if (action === 'close-conflict') {
+        hideEditorConflict();
+        setEditorSaveState('dirty', '有未保存的更改');
+      }
+      else if (action === 'mode-edit') setEditorMode('edit');
+      else if (action === 'mode-preview') setEditorMode('preview');
+      else if (EDITOR_TOOLBAR[action]) EDITOR_TOOLBAR[action]();
+    });
+    document.getElementById('editor-image-input').addEventListener('change', e => {
+      const files = Array.from(e.target.files || []);
+      files.forEach(f => uploadAndInsertImage(f));
+      e.target.value = '';
+    });
+    document.addEventListener('keydown', e => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === 's' || e.key === 'S')) {
+        if (editorOpen) {
+          e.preventDefault();
+          saveEditor();
+        }
+      }
+    });
+    window.addEventListener('beforeunload', e => {
+      if (editorOpen && editorDirty) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
     loadList();
     setInterval(() => {
       if (!userInteracting) {
@@ -3349,6 +4426,11 @@ HTML = """<!DOCTYPE html>
       if (revealBtn) revealReaderFile();
       const openBtn = e.target.closest('[data-action="openReaderFile"]');
       if (openBtn) openReaderFile();
+      const editBtn = e.target.closest('[data-action="editNote"]');
+      if (editBtn) {
+        const file = document.getElementById('reader').dataset.file || '';
+        if (file) openEditor(file);
+      }
     });
 
     document.getElementById('modal-overlay').addEventListener('click', e => {

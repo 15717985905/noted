@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-09-13
+
+### Added
+
+- Markdown 网页编辑工作台：原文编辑、桌面双栏预览、移动端编辑/预览切换
+- 编辑工具栏：标题、强调、链接、引用、代码块、列表、任务列表、表格和图片
+- 文本/AI Markdown 原样粘贴，剪贴板图片本地保存并自动插入 Markdown 引用
+- 保存快捷键、未保存提示、revision 冲突保护和软链接源文件确认
+- 编辑、预览、保存、图片上传和本地资源读取 API
+- 图片类型、大小、文件魔数、路径穿越和 XSS 防护
+
 ## [0.3.0] - 2026-09-12
 
 ### Added

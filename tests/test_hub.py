@@ -6,6 +6,8 @@ import json
 import socket
 import threading
 import time
+import base64
+import http.client
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -280,6 +282,16 @@ class _HTTPServerFixture(unittest.TestCase):
             return e.code, e.headers, e.read().decode("utf-8")
         except Exception as e:
             return None, None, str(e)
+
+    def _request_bytes(self, path):
+        req = urllib.request.Request(self._url(path))
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.headers, e.read()
+        except Exception as e:
+            return None, None, str(e).encode("utf-8")
 
 
 class TestRealHTTPIntegration(_HTTPServerFixture):
@@ -2369,6 +2381,498 @@ class TestGroups(_HTTPServerFixture):
         self.assertEqual(status, 200)
         data = json.loads(body)
         self.assertFalse(data["ok"])
+
+
+class TestEditorAPI(_HTTPServerFixture):
+    PNG_1PX = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChAGGA4KrCQAAAABJRU5ErkJggg=="
+
+    def _post_json(self, path, obj):
+        data = json.dumps(obj).encode("utf-8")
+        status, headers, body = self._request(
+            path,
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(data)),
+            },
+            data=data,
+        )
+        return status, headers, body
+
+    def _note(self, name="note.md", content="# Note\n\nbody\n"):
+        with open(os.path.join(self.tmpdir, name), "w", encoding="utf-8") as f:
+            f.write(content)
+
+    def _edit(self, file_name):
+        status, _, body = self._request(f"/api/edit?file={urllib.parse.quote(file_name)}")
+        if status != 200:
+            return status, None
+        return status, json.loads(body)
+
+    def test_edit_returns_content_and_revision(self):
+        self._note("note.md", "# Note\n\nbody\n")
+        self._start_server()
+        status, data = self._edit("note.md")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["file"], "note.md")
+        self.assertEqual(data["content"], "# Note\n\nbody\n")
+        self.assertTrue(data["revision"])
+        self.assertFalse(data["is_symlink"])
+
+    def test_edit_revision_tracks_file(self):
+        self._note("note.md", "# Note\n\nbody\n")
+        self._start_server()
+        _, first = self._edit("note.md")
+        with open(os.path.join(self.tmpdir, "note.md"), "w", encoding="utf-8") as f:
+            f.write("# Note\n\nbody updated\n")
+        _, second = self._edit("note.md")
+        self.assertNotEqual(first["revision"], second["revision"])
+        self.assertEqual(second["content"], "# Note\n\nbody updated\n")
+
+    def test_edit_missing_404(self):
+        self._start_server()
+        status, _ = self._edit("missing.md")
+        self.assertEqual(status, 404)
+
+    def test_edit_traversal_400(self):
+        self._start_server()
+        status, _ = self._edit("../../etc/passwd")
+        self.assertEqual(status, 400)
+
+    def test_edit_non_note_400(self):
+        self._start_server()
+        status, _ = self._edit(".index.json")
+        self.assertEqual(status, 400)
+
+    def test_preview_table_task_xss(self):
+        self._start_server()
+        md = (
+            "| 甲 | 乙 |\n| - | - |\n| 1 | 2 |\n\n"
+            "- [x] done\n- [ ] todo\n\n"
+            "<script>window.x=1</script>\n\n"
+            "![bad](//evil.com/img.png)\n\n"
+            "[x](javascript:alert(1))\n"
+        )
+        status, _, body = self._post_json("/api/preview", {"content": md})
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        html = data["html"]
+        self.assertIn("<table>", html)
+        self.assertIn("<th>甲</th>", html)
+        self.assertIn("<td>1</td>", html)
+        self.assertIn('type="checkbox" disabled checked', html)
+        self.assertIn('class="task"', html)
+        self.assertIn("&lt;script&gt;", html)
+        self.assertNotIn("<script>", html)
+        self.assertNotIn("//evil.com", html)
+        self.assertNotIn("javascript:", html)
+
+    def test_preview_non_string_content_400(self):
+        self._start_server()
+        for bad in [123, None, [], {}]:
+            status, _, _ = self._post_json("/api/preview", {"content": bad})
+            self.assertEqual(status, 400)
+
+    def test_preview_oversize_400(self):
+        self._start_server()
+        status, _, _ = self._post_json("/api/preview", {"content": "x" * 1000001})
+        self.assertEqual(status, 400)
+
+    def test_save_local_success(self):
+        self._note("note.md", "# Old\n\nold body\n")
+        self._start_server()
+        _, data = self._edit("note.md")
+        status, _, body = self._post_json(
+            "/api/save",
+            {"file": "note.md", "content": "# New\n\nnew body\n", "revision": data["revision"]},
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["propagated"], False)
+        with open(os.path.join(self.tmpdir, "note.md"), "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "# New\n\nnew body\n")
+        _, after = self._edit("note.md")
+        self.assertEqual(after["revision"], result["revision"])
+        self.assertEqual(after["content"], "# New\n\nnew body\n")
+
+    def test_save_revision_conflict(self):
+        self._note("note.md", "# A\n")
+        self._start_server()
+        _, first = self._edit("note.md")
+        with open(os.path.join(self.tmpdir, "note.md"), "w", encoding="utf-8") as f:
+            f.write("# B externally\n")
+        _, second = self._edit("note.md")
+        self.assertNotEqual(first["revision"], second["revision"])
+        status, _, body = self._post_json(
+            "/api/save",
+            {"file": "note.md", "content": "mine", "revision": first["revision"]},
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["conflict"])
+        self.assertEqual(result["revision"], second["revision"])
+        with open(os.path.join(self.tmpdir, "note.md"), "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "# B externally\n")
+
+    def _make_symlink_note(self):
+        target = os.path.join(self.tmpdir, "real.md")
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("# Source\n\noriginal body\n")
+        os.symlink(target, os.path.join(self.tmpdir, "link.md"))
+        return target
+
+    def test_save_symlink_requires_propagate(self):
+        target = self._make_symlink_note()
+        self._start_server()
+        _, data = self._edit("link.md")
+        self.assertTrue(data["is_symlink"])
+        status, _, body = self._post_json(
+            "/api/save",
+            {"file": "link.md", "content": "new", "revision": data["revision"], "propagate": False},
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result.get("symlink"))
+        self.assertTrue(result.get("requires_propagate"))
+        with open(target, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "# Source\n\noriginal body\n")
+
+    def test_save_symlink_propagate_writes_source(self):
+        target = self._make_symlink_note()
+        self._start_server()
+        _, data = self._edit("link.md")
+        status, _, body = self._post_json(
+            "/api/save",
+            {"file": "link.md", "content": "# Source\n\nedited\n", "revision": data["revision"], "propagate": True},
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["propagated"])
+        with open(target, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "# Source\n\nedited\n")
+        _, after = self._edit("link.md")
+        self.assertNotEqual(after["revision"], data["revision"])
+
+    def test_save_symlink_shared_target_rejected(self):
+        target = self._make_symlink_note()
+        os.symlink(target, os.path.join(self.tmpdir, "link2.md"))
+        self._start_server()
+        _, data = self._edit("link.md")
+        status, _, body = self._post_json(
+            "/api/save",
+            {"file": "link.md", "content": "new", "revision": data["revision"], "propagate": True},
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertFalse(result["ok"])
+        self.assertTrue(result.get("symlink"))
+        self.assertIn("无法安全写入", result.get("error", ""))
+        with open(target, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "# Source\n\noriginal body\n")
+
+    def test_save_missing_404(self):
+        self._start_server()
+        status, _, body = self._post_json(
+            "/api/save", {"file": "missing.md", "content": "x", "revision": "1:1"}
+        )
+        self.assertEqual(status, 404)
+
+    def test_save_traversal_400(self):
+        self._start_server()
+        status, _, body = self._post_json(
+            "/api/save", {"file": "../evil.md", "content": "x", "revision": "1:1"}
+        )
+        self.assertEqual(status, 400)
+
+    def test_save_non_string_fields_400(self):
+        self._note("a.md")
+        self._start_server()
+        for payload in [
+            {"file": 1, "content": "x", "revision": "1"},
+            {"file": "a.md", "content": 5, "revision": "1"},
+            {"file": "a.md", "content": "x", "revision": [1]},
+            {"file": "a.md", "content": "x"},
+        ]:
+            status, _, _ = self._post_json("/api/save", payload)
+            self.assertEqual(status, 400)
+
+    def test_upload_valid_png_roundtrip(self):
+        self._note("note.md")
+        self._start_server()
+        expected = base64.b64decode(self.PNG_1PX)
+        status, _, body = self._post_json(
+            "/api/upload",
+            {"file": "note.md", "data": self.PNG_1PX, "mime": "image/png", "filename": "shot.png"},
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertTrue(result["ok"])
+        url = result["url"]
+        self.assertTrue(url.startswith("note/"))
+        self.assertTrue(url.endswith(".png"))
+        asset_path = os.path.join(self.tmpdir, "._assets_", url)
+        self.assertTrue(os.path.isfile(asset_path))
+        with open(asset_path, "rb") as f:
+            self.assertEqual(f.read(), expected)
+        from noted.hub import simple_markdown
+        rendered = simple_markdown(f"![shot]({url})")
+        asset_qs = "/api/asset?file=" + urllib.parse.quote(url, safe="/")
+        self.assertIn('src="' + asset_qs + '"', rendered)
+        s2, headers, payload = self._request_bytes("/api/asset?file=" + urllib.parse.quote(url, safe="/"))
+        self.assertEqual(s2, 200)
+        self.assertEqual(headers.get("Content-Type"), "image/png")
+        self.assertEqual(payload, expected)
+        _, edit_data = self._edit("note.md")
+        s3, _, b3 = self._post_json(
+            "/api/save",
+            {"file": "note.md", "content": f"# N\n\n![shot]({url})\n", "revision": edit_data["revision"]},
+        )
+        self.assertEqual(s3, 200)
+        s4, _, b4 = self._request("/api/read/html?file=note.md")
+        self.assertEqual(s4, 200)
+        self.assertIn('src="/api/asset?file=' + urllib.parse.quote(url, safe="/") + '"', b4)
+
+    def test_upload_forged_magic_rejected(self):
+        self._note("note.md")
+        self._start_server()
+        gif_bytes = b"GIF89a" + b"\x01\x00\x01\x00\x00\x00\x00"
+        fake_gif_as_png = base64.b64encode(gif_bytes).decode("ascii")
+        status, _, body = self._post_json(
+            "/api/upload",
+            {"file": "note.md", "data": fake_gif_as_png, "mime": "image/png", "filename": "shot.png"},
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertFalse(result["ok"])
+        self.assertIn("文件内容与类型不符", result.get("error", ""))
+        png_as_jpeg = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 24).decode("ascii")
+        status, _, body = self._post_json(
+            "/api/upload",
+            {"file": "note.md", "data": png_as_jpeg, "mime": "image/jpeg", "filename": "shot.jpg"},
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertFalse(result["ok"])
+        asset_root = os.path.join(self.tmpdir, "._assets_")
+        stored = sorted(os.listdir(asset_root)) if os.path.isdir(asset_root) else []
+        self.assertEqual(stored, [])
+
+    def test_upload_invalid_mime_rejected(self):
+        self._note("note.md")
+        self._start_server()
+        status, _, body = self._post_json(
+            "/api/upload",
+            {"file": "note.md", "data": self.PNG_1PX, "mime": "text/html", "filename": "a.html"},
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertFalse(result["ok"])
+        self.assertIn("不支持的图片类型", result.get("error", ""))
+        status, _, body = self._post_json(
+            "/api/upload", {"file": "note.md", "data": self.PNG_1PX, "mime": 123}
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(json.loads(body)["ok"])
+
+    def test_upload_bad_filename_ext_rejected(self):
+        self._note("note.md")
+        self._start_server()
+        status, _, body = self._post_json(
+            "/api/upload",
+            {"file": "note.md", "data": self.PNG_1PX, "mime": "image/png", "filename": "evil.sh"},
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertFalse(result["ok"])
+        self.assertIn("扩展名不符合图片类型", result.get("error", ""))
+
+    def test_upload_traversal_and_missing_note(self):
+        self._note("note.md")
+        self._start_server()
+        status, _, _ = self._post_json(
+            "/api/upload",
+            {"file": "../../evil.md", "data": self.PNG_1PX, "mime": "image/png"},
+        )
+        self.assertEqual(status, 400)
+        status, _, _ = self._post_json(
+            "/api/upload",
+            {"file": "nope9.md", "data": self.PNG_1PX, "mime": "image/png"},
+        )
+        self.assertEqual(status, 404)
+
+    def test_upload_invalid_base64_rejected(self):
+        self._note("note.md")
+        self._start_server()
+        for payload in [
+            {"file": "note.md", "data": "!!!not-base64", "mime": "image/png"},
+            {"file": "note.md", "data": "", "mime": "image/png"},
+            {"file": "note.md", "data": 66, "mime": "image/png"},
+        ]:
+            status, _, body = self._post_json("/api/upload", payload)
+            self.assertEqual(status, 200)
+            self.assertFalse(json.loads(body)["ok"])
+
+    def test_asset_traversal_rejected(self):
+        self._note("note.md")
+        self._start_server()
+        for path in [
+            "/api/asset?file=" + urllib.parse.quote("../../etc/passwd"),
+            "/api/asset?file=" + urllib.parse.quote("note/../evil.png"),
+            "/api/asset?file=",
+        ]:
+            status, _, _ = self._request(path)
+            self.assertEqual(status, 400)
+
+    def test_asset_only_serves_assets_dir(self):
+        self._note("note.md")
+        self._start_server()
+        asset_dir = os.path.join(self.tmpdir, "._assets_", "note")
+        os.makedirs(asset_dir, exist_ok=True)
+        with open(os.path.join(asset_dir, "evil.txt"), "w", encoding="utf-8") as f:
+            f.write("secret text data")
+        status, _, _ = self._request("/api/asset?file=note/evil.txt")
+        self.assertEqual(status, 404)
+        with open(os.path.join(self.tmpdir, "secret.png"), "wb") as f:
+            f.write(base64.b64decode(self.PNG_1PX))
+        status, _, _ = self._request("/api/asset?file=secret.png")
+        self.assertEqual(status, 404)
+
+    def test_editor_endpoints_malicious_host_or_origin_403(self):
+        self._note("note.md")
+        self._start_server()
+        req = urllib.request.Request(self._url("/api/edit?file=note.md"))
+        req.add_header("Host", "evil.com")
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                self.fail(f"Expected 403 but got {resp.status}")
+        except urllib.error.HTTPError as e:
+            self.assertEqual(e.code, 403)
+        payload = json.dumps({"file": "note.md", "content": "x", "revision": "1"}).encode("utf-8")
+        status, _, _ = self._request(
+            "/api/save",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": "http://evil.com",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 403)
+        status, _, _ = self._request(
+            "/api/preview",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": "null",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 403)
+        status, _, _ = self._request(
+            "/api/upload",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": "http://127.0.0.1:9999",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 403)
+
+    def test_editor_responses_have_no_cors_header(self):
+        self._note("note.md")
+        self._start_server()
+        status, headers, _ = self._request("/api/edit?file=note.md")
+        self.assertEqual(status, 200)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+        _, headers, _ = self._request("/api/preview", method="POST",
+                                      headers={
+                                          "Host": f"localhost:{self.port}",
+                                          "Origin": f"http://localhost:{self.port}",
+                                          "Content-Type": "application/json",
+                                          "Content-Length": "2",
+                                      },
+                                      data=b"{}")
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+        status, headers, _ = self._request_bytes("/api/asset?file=note/abc.png")
+        self.assertEqual(status, 404)
+        self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+
+class TestPOSTBodyHardening(_HTTPServerFixture):
+    def _raw_post(self, path, content_length):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.putrequest("POST", path)
+        conn.putheader("Host", f"localhost:{self.port}")
+        conn.putheader("Origin", f"http://localhost:{self.port}")
+        conn.putheader("Content-Length", content_length)
+        conn.endheaders()
+        try:
+            resp = conn.getresponse()
+            status = resp.status
+            resp.read()
+        finally:
+            conn.close()
+        return status
+
+    def test_non_numeric_content_length_400(self):
+        self._start_server()
+        for path, cl in [
+            ("/api/preview", "abc"),
+            ("/api/preview", "-1"),
+            ("/api/save", "1e6"),
+        ]:
+            self.assertEqual(self._raw_post(path, cl), 400)
+
+    def test_oversized_content_length_400(self):
+        self._start_server()
+        self.assertEqual(self._raw_post("/api/save", "13421773"), 400)
+        self.assertEqual(self._raw_post("/api/tags", "1048577"), 400)
+
+    def test_non_object_json_400(self):
+        self._start_server()
+        for raw in [b"[1, 2, 3]", b'"not-an-object"', b"42", b"null"]:
+            status, _, _ = self._request(
+                "/api/preview",
+                method="POST",
+                headers={
+                    "Host": f"localhost:{self.port}",
+                    "Origin": f"http://localhost:{self.port}",
+                    "Content-Type": "application/json",
+                    "Content-Length": str(len(raw)),
+                },
+                data=raw,
+            )
+            self.assertEqual(status, 400)
+
+    def test_malformed_json_400(self):
+        self._start_server()
+        raw = b'{"content":'
+        status, _, _ = self._request(
+            "/api/preview",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(raw)),
+            },
+            data=raw,
+        )
+        self.assertEqual(status, 400)
 
 
 if __name__ == "__main__":
