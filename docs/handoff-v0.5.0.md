@@ -1,9 +1,9 @@
 # Noted 主管交接文档
 
-> 版本：v0.5.0 → v0.6.0 准备  
+> 版本：v0.5.x → v0.6.0 准备  
 > 日期：2026-09-14  
 > 仓库：https://github.com/15717985905/noted  
-> 基线：`d59f7a8`（Release v0.5.0）
+> 基线：`007427e`（tag-driven versioning）
 
 ---
 
