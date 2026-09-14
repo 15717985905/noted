@@ -19,6 +19,7 @@
 - 实际发布版本以 Git tag `vMAJOR.MINOR.PATCH` 为准，如 `v0.5.1`、`v0.5.2`。
 - `pyproject.toml` 的 `version` 仅作为包基础版本，不随每次补丁发布修改。
 - 运行时网页标题与 `/api/list` 返回的 `version` 来自当前 tag；无 tag 时回退到 `pyproject.toml` 版本。
+- 发布流程：更新 `CHANGELOG.md` → 测试全绿 → 提交 → 打 tag → 创建 GitHub Release。
 
 ---
 
