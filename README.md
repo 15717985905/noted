@@ -123,6 +123,12 @@ A: 每个用户需要独立安装和运行，服务仅监听本地回环地址�
 **Q: 为什么需要 python3？**
 A: 落笔 Noted 使用 Python 3.10+ 编写，零第三方依赖，macOS 自带 Python 即可运行。
 
+## 版本说明
+
+- 实际发布版本以 Git tag `vMAJOR.MINOR.PATCH` 为准，如 `v0.5.1`、`v0.5.2`。
+- `pyproject.toml` 的 `version` 仅作为包基础版本，不随每次补丁发布修改。
+- 运行时网页标题与 `/api/list` 返回的 `version` 来自当前 tag；无 tag 时回退到 `pyproject.toml` 版本。
+
 ## 开发与测试
 
 ```bash

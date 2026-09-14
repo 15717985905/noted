@@ -65,6 +65,37 @@ def get_port() -> int:
     return DEFAULT_PORT
 
 
+def _read_git_version() -> str:
+    try:
+        head = subprocess.check_output(
+            ["git", "tag", "--points-at", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", errors="replace")
+        tags = [line.strip() for line in head.splitlines() if line.strip()]
+        if tags:
+            tag = tags[0]
+            if tag.startswith("v"):
+                return tag[1:]
+    except Exception:
+        pass
+    return ""
+
+
+def get_app_version() -> str:
+    version = _read_git_version()
+    if not version:
+        try:
+            with open(os.path.join(os.path.dirname(__file__), "..", "pyproject.toml"), "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("version = "):
+                        version = line.split("=", 1)[1].strip().strip('"')
+                        break
+        except Exception:
+            pass
+    return version or "0.5.0"
+
+
 def load_index(notes_dir: str):
     index_file = os.path.join(notes_dir, ".index.json")
     if os.path.isfile(index_file):
@@ -2097,7 +2128,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>落笔 · Noted</title>
+<title>落笔 · Noted {version}</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -5985,6 +6016,9 @@ HTML = """<!DOCTYPE html>
   </script>
 </body>
 </html>"""
+
+app_version = get_app_version()
+HTML = HTML.replace("{version}", app_version)
 
 
 def run_server(port: Optional[int] = None, notes_dir: Optional[str] = None):

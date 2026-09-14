@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Versioning
+
+- 实际发布版本以 Git tag `vMAJOR.MINOR.PATCH` 为准。
+- `pyproject.toml` 的 `version` 仅作为包基础版本，不随每次补丁发布修改。
+- 运行时网页标题与 `/api/list` 返回的 `version` 来自当前 tag；无 tag 时回退到 `pyproject.toml` 版本。
+
 ## [0.5.0] - 2026-09-14
 
 ### Added

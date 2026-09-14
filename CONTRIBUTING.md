@@ -32,7 +32,7 @@ python -m py_compile src/noted/hub.py src/noted/cli.py
 ## 发布流程
 
 - 更新 `CHANGELOG.md`
-- 更新 `pyproject.toml` 版本号
 - 确保 `python -W error::ResourceWarning -m unittest discover tests -v` 全部通过
 - 确保 `python -m py_compile` 全部通过
-- 提交并打 tag
+- 提交并打 tag，tag 格式为 `vMAJOR.MINOR.PATCH`，如 `v0.5.1`、`v0.5.2`
+- 实际版本号以 Git tag 为准，无需修改 `pyproject.toml` 的 `version`
