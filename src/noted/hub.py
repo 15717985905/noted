@@ -417,6 +417,8 @@ MAX_PREVIEW_CHARS = 1000000
 
 MAX_SAVE_CHARS = 2000000
 
+MAX_NOTE_CHARS = 500
+
 MAX_IMAGE_BASE64_CHARS = int(IMAGE_MAX_SIZE * 4 / 3) + 8192
 
 MAX_UPLOAD_BODY_BYTES = 12 * 1024 * 1024
@@ -552,7 +554,25 @@ def _split_table_row(line):
         s = s[1:]
     if s.endswith("|"):
         s = s[:-1]
-    return [c.strip() for c in s.split("|")]
+    cells = []
+    buf = ""
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == "\\" and i + 1 < n and s[i + 1] == "|":
+            buf += "|"
+            i += 2
+            continue
+        if ch == "|":
+            cells.append(buf.strip())
+            buf = ""
+            i += 1
+            continue
+        buf += ch
+        i += 1
+    cells.append(buf.strip())
+    return cells
 
 
 def _inline_html(s):
@@ -1457,7 +1477,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             if not isinstance(entry, dict):
                 continue
             name = entry.get("name")
-            if entry.get("view") and isinstance(name, str) and name:
+            if entry.get("view") and isinstance(name, str) and name and not name.startswith("_note_"):
                 filters = entry.get("filters", {})
                 if not isinstance(filters, dict):
                     filters = {}
@@ -1815,6 +1835,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def send_tags(self, data):
         filename = data.get("file", "")
         tags = data.get("tags", [])
+        has_note = "note" in data
+        note = data.get("note") if has_note else None
         if not is_safe_note_ref(filename):
             self.send_error(400)
             return
@@ -1823,11 +1845,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if not os.path.isfile(path):
             self.send_error(404)
             return
+        if has_note and note is not None and not isinstance(note, str):
+            self.send_json({"ok": False, "error": "备注必须为字符串"})
+            return
         safe_tags = [t for t in tags if isinstance(t, str)] if isinstance(tags, list) else []
         index = load_index(notes_dir)
         if filename not in index:
             index[filename] = {}
         index[filename]["tags"] = safe_tags
+        if has_note:
+            if note is None:
+                index[filename].pop("note", None)
+            else:
+                index[filename]["note"] = note[:MAX_NOTE_CHARS]
         index[filename]["updated_at"] = datetime.now().isoformat()
         save_index(notes_dir, index)
         self.send_json({"ok": True})
@@ -2066,6 +2096,7 @@ HTML = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>落笔 · Noted</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -2220,7 +2251,7 @@ HTML = """<!DOCTYPE html>
     font-weight: 600;
     margin-bottom: 6px;
     color: #1d1d1f;
-    padding-right: 40px;
+    padding-right: 72px;
   }
   .note-star {
     position: absolute;
@@ -2313,6 +2344,100 @@ HTML = """<!DOCTYPE html>
     align-items: center;
     flex-wrap: wrap;
   }
+  .reader-mode-bar {
+    display: inline-flex;
+    gap: 4px;
+    margin-left: 10px;
+    vertical-align: middle;
+  }
+  .reader-mode-btn {
+    padding: 3px 10px;
+    border: 1px solid #d2d2d7;
+    background: #fff;
+    border-radius: 8px;
+    font-size: 12px;
+    cursor: pointer;
+    color: #1d1d1f;
+  }
+  .reader-mode-btn.active {
+    background: #007aff;
+    color: #fff;
+    border-color: #007aff;
+  }
+  #word-editor-wrap { display: none; }
+  #word-toolbar {
+    display: flex;
+    align-items: center;
+    flex-wrap: nowrap;
+    gap: 6px;
+    max-width: 820px;
+    margin: 0 auto 12px;
+    padding: 8px 12px;
+    background: #f5f5f7;
+    border-radius: 8px;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  #word-toolbar .btn {
+    flex: 0 0 auto;
+    padding: 4px 10px;
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  #word-paper {
+    max-width: 820px;
+    margin: 0 auto;
+    background: #fff;
+    border-radius: 12px;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+    padding: 56px 64px;
+    min-height: 60vh;
+    font-family: -apple-system, "New York", Georgia, "Times New Roman", "Songti SC", "SimSun", serif;
+    font-size: 16px;
+    line-height: 1.8;
+    color: #1d1d1f;
+  }
+  #word-paper:focus { outline: none; }
+  #word-paper h1 { font-size: 24px; }
+  #word-paper h2 { font-size: 20px; }
+  #word-paper h3 { font-size: 17px; }
+  #word-paper p { margin: 10px 0; }
+  #word-paper ul, #word-paper ol { padding-left: 24px; }
+  #word-paper li { margin: 4px 0; }
+  #word-paper li input[type="checkbox"] { margin-right: 8px; }
+  #word-paper pre {
+    background: #f5f5f7;
+    padding: 12px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 14px;
+  }
+  #word-paper code {
+    background: #f5f5f7;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 14px;
+    font-family: "SF Mono", monospace;
+  }
+  #word-paper pre code {
+    background: none;
+    padding: 0;
+  }
+  #word-paper blockquote {
+    border-left: 3px solid #d2d2d7;
+    padding-left: 12px;
+    color: #86868b;
+  }
+  #word-paper table { border-collapse: collapse; margin: 12px 0; width: 100%; }
+  #word-paper th, #word-paper td { border: 1px solid #e5e5e5; padding: 6px 10px; font-size: 14px; }
+  #word-paper th { background: #f5f5f7; }
+  #word-paper img { max-width: 100%; }
+  #word-paper hr { border: none; border-top: 1px solid #e5e5e5; margin: 20px 0; }
+  #word-save-state { font-size: 12px; color: #86868b; flex: 0 0 auto; white-space: nowrap; }
+  #word-save-state.dirty { color: #ff9500; }
+  #word-save-state.saved { color: #34c759; }
+  #word-save-state.error { color: #ff3b30; }
+  #word-save-state.conflict { color: #ff9500; }
   .reader-body { line-height: 1.8; font-size: 16px; color: #1d1d1f; }
   .reader-body h1, .reader-body h2 { margin-top: 28px; margin-bottom: 12px; }
   .reader-body h3 { margin-top: 20px; margin-bottom: 8px; }
@@ -2546,6 +2671,7 @@ HTML = """<!DOCTYPE html>
     .sidebar-overlay.show { display: block; }
     .mobile-menu-btn { display: flex; }
     .main { padding: 16px; }
+    .toolbar { padding-left: 52px; }
     .reader { padding: 20px; }
   }
   .group-header {
@@ -2588,23 +2714,6 @@ HTML = """<!DOCTYPE html>
     margin-left: 24px;
     border-left: 2px solid #e5e5e5;
     padding-left: 8px;
-  }
-  .group-file {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 0;
-    font-size: 14px;
-  }
-  .group-file .file-name {
-    flex: 1;
-    color: #1d1d1f;
-  }
-  .group-file .file-remove {
-    color: #ff3b30;
-    cursor: pointer;
-    font-size: 12px;
-    padding: 2px 6px;
   }
   .ungrouped-zone {
     border: 2px dashed #d2d2d7;
@@ -2799,6 +2908,156 @@ HTML = """<!DOCTYPE html>
     .editor-pane-edit { display: block; }
     .editor-pane-edit.inactive { display: none; }
   }
+  .group-bar {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+    background: #fff;
+    border: 1px solid #e5e5e5;
+    border-radius: 10px;
+    margin-bottom: 12px;
+  }
+  .group-bar-label {
+    font-size: 12px;
+    color: #86868b;
+    user-select: none;
+  }
+  .group-capsule {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    background: #eef3ff;
+    color: #1a56db;
+    border-radius: 14px;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .group-capsule:hover { background: #dbe6ff; }
+  .group-capsule .group-capsule-count {
+    background: #1a56db;
+    color: #fff;
+    border-radius: 8px;
+    padding: 0 6px;
+    font-size: 11px;
+    line-height: 16px;
+  }
+  .group-capsule.drag-over {
+    background: #007aff;
+    color: #fff;
+  }
+  .group-capsule.drag-over .group-capsule-count {
+    background: #fff;
+    color: #007aff;
+  }
+  .group-capsule-new {
+    display: inline-flex;
+    align-items: center;
+    padding: 5px 12px;
+    background: #f5f5f7;
+    color: #1d1d1f;
+    border: 1px dashed #d2d2d7;
+    border-radius: 14px;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+    min-width: 60px;
+    justify-content: center;
+  }
+  .group-capsule-new:hover { background: #f0f8ff; color: #007aff; }
+  .group-capsule-new.drag-over {
+    background: #f0f8ff;
+    color: #007aff;
+    border-color: #007aff;
+  }
+  .note-more {
+    position: absolute;
+    top: 14px;
+    right: 44px;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    background: none;
+    border: none;
+    padding: 4px 6px;
+    color: #86868b;
+    opacity: 0.6;
+    transition: opacity 0.15s;
+  }
+  .note:hover .note-more { opacity: 1; }
+  .note-more:hover { color: #1d1d1f; }
+  .ctx-menu {
+    display: none;
+    position: fixed;
+    z-index: 1200;
+    min-width: 180px;
+    max-width: 280px;
+    background: #fff;
+    border: 1px solid #e5e5e7;
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+    padding: 6px;
+  }
+  .ctx-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: #86868b;
+    padding: 6px 10px 4px;
+    user-select: none;
+  }
+  .ctx-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    font-size: 13px;
+    border-radius: 6px;
+    cursor: pointer;
+    position: relative;
+    user-select: none;
+    color: #1d1d1f;
+  }
+  .ctx-item:hover { background: #f5f5f7; }
+  .ctx-item.ctx-danger { color: #ff3b30; }
+  .ctx-item.ctx-disabled, .ctx-item.ctx-hint { color: #86868b; cursor: default; }
+  .ctx-item.ctx-disabled:hover, .ctx-item.ctx-hint:hover { background: none; }
+  .ctx-icon {
+    width: 16px;
+    text-align: center;
+    flex-shrink: 0;
+  }
+  .ctx-label { flex: 1; }
+  .ctx-caret {
+    color: #86868b;
+    font-size: 11px;
+  }
+  .ctx-submenu {
+    display: none;
+    position: absolute;
+    left: calc(100% - 10px);
+    top: 0;
+    min-width: 160px;
+    max-height: 240px;
+    overflow-y: auto;
+    background: #fff;
+    border: 1px solid #e5e5e7;
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.15);
+    padding: 6px;
+    z-index: 1;
+  }
+  .ctx-submenu.open { display: block; }
+  .ctx-submenu.ctx-flip-left {
+    left: auto;
+    right: calc(100% - 10px);
+  }
+  .ctx-submenu .ctx-item {
+    font-size: 12px;
+    padding: 6px 8px;
+  }
 </style>
 </head>
 <body>
@@ -2858,6 +3117,11 @@ HTML = """<!DOCTYPE html>
     <div id="note-list"></div>
     <div id="reader" class="reader" data-file="">
       <span class="reader-back" data-action="showList">← 返回列表</span>
+      <div id="reader-mode-bar" class="reader-mode-bar">
+        <button class="reader-mode-btn active" data-reader-mode="read">阅读</button>
+        <button class="reader-mode-btn" data-reader-mode="word">Word</button>
+        <button class="reader-mode-btn" data-reader-mode="markdown">Markdown</button>
+      </div>
       <button class="btn" data-action="renameReaderNote" id="reader-rename-btn" style="display:none;margin-left:8px;">重命名</button>
       <button class="btn btn-primary" data-action="editNote" id="reader-edit-btn" style="display:none;margin-left:8px;">编辑</button>
       <div id="reader-meta" style="display:none;padding:8px 12px;background:#f5f5f7;border-radius:8px;margin:8px 0;font-size:13px;">
@@ -2869,6 +3133,29 @@ HTML = """<!DOCTYPE html>
         <span id="reader-feedback" style="margin-left:8px;color:#007aff;font-size:12px;display:none;"></span>
       </div>
       <div id="reader-content"></div>
+      <div id="word-editor-wrap">
+        <div id="word-toolbar">
+          <button class="btn" data-word-action="paragraph">正文</button>
+          <button class="btn" data-word-action="h1">H1</button>
+          <button class="btn" data-word-action="h2">H2</button>
+          <button class="btn" data-word-action="h3">H3</button>
+          <button class="btn" data-word-action="bold" style="font-weight:700;">粗体</button>
+          <button class="btn" data-word-action="italic" style="font-style:italic;">斜体</button>
+          <button class="btn" data-word-action="inline-code">行内代码</button>
+          <button class="btn" data-word-action="link">链接</button>
+          <button class="btn" data-word-action="quote">引用</button>
+          <button class="btn" data-word-action="codeblock">代码块</button>
+          <button class="btn" data-word-action="unordered-list">无序</button>
+          <button class="btn" data-word-action="ordered-list">有序</button>
+          <button class="btn" data-word-action="task-list">任务</button>
+          <button class="btn" data-word-action="table">表格</button>
+          <button class="btn" data-word-action="image">图片</button>
+          <button class="btn" data-action="wordSave">保存</button>
+          <span id="word-save-state"></span>
+          <input type="file" id="word-image-input" accept="image/png,image/jpeg,image/gif,image/webp" style="display:none;" />
+        </div>
+        <div id="word-paper" contenteditable="true"></div>
+      </div>
       <div class="related-section" id="related-section" style="display:none;">
         <div class="related-title">相关笔记</div>
         <div id="related-list"></div>
@@ -2877,6 +3164,7 @@ HTML = """<!DOCTYPE html>
     <div id="editor" class="reader" style="display:none;">
       <div style="display:flex;align-items:center;flex-wrap:wrap;gap:8px;">
         <span class="reader-back" data-edit="back">← 返回</span>
+        <button class="btn" data-edit="back-reader" style="margin-left:8px;">返回阅读</button>
         <span id="editor-title" style="font-size:18px;font-weight:700;"></span>
       </div>
       <div id="editor-meta" style="display:none;padding:8px 12px;background:#f5f5f7;border-radius:8px;margin:8px 0;font-size:13px;">
@@ -2931,7 +3219,8 @@ HTML = """<!DOCTYPE html>
       <div id="discover-empty" style="text-align:center;padding:40px;color:#86868b;display:none;">没有发现候选文件</div>
     </div>
   </main>
-  <div class="modal-overlay" id="modal-overlay" data-action="closeModal">
+    <div class="ctx-menu" id="ctx-menu"></div>
+    <div class="modal-overlay" id="modal-overlay" data-action="closeModal">
     <div class="modal" id="modal" data-action="stopPropagation">
       <div class="modal-title" id="modal-title">标题</div>
       <div class="modal-body" id="modal-body">内容</div>
@@ -2986,58 +3275,6 @@ HTML = """<!DOCTYPE html>
       renderList(allNotes);
       renderTags(allNotes);
     }
-    function renderList(notes) {
-      const el = document.getElementById('note-list');
-      const empty = document.getElementById('empty');
-      const countEl = document.getElementById('note-count');
-      const filtered = notes.filter(n => {
-        if (activeTag && !n.tags.includes(activeTag)) return false;
-        if (searchQuery) {
-          const q = searchQuery.toLowerCase();
-          const text = `${n.title} ${n.tags.join(' ')} ${n.excerpt} ${n.content}`.toLowerCase();
-          return text.includes(q);
-        }
-        return true;
-      });
-      countEl.textContent = `共 ${filtered.length} 条总结`;
-      if (!filtered.length) { el.innerHTML = ''; empty.style.display = 'block'; return; }
-      empty.style.display = 'none';
-      el.innerHTML = filtered.map(n => `
-        <div class="note ${selectedFiles.has(n.file) ? 'selected' : ''}" data-file="${escapeHtml(n.file)}">
-          <button class="note-star ${n.starred ? 'starred' : ''}" data-action="toggleStar" data-file="${escapeHtml(n.file)}">${n.starred ? '★' : '☆'}</button>
-          <div class="note-title">${highlightText(n.title, searchQuery)}</div>
-          <div class="note-meta">
-            <span>${n.date} ${n.time}</span>
-            ${n.is_symlink ? `<span class="note-source" title="${escapeHtml(n.source || '')}">📎 ${escapeHtml(n.source_label || '')}</span>` : ''}
-          </div>
-          <div class="note-meta">
-            ${n.tags.map(t => `<span class="tag">${highlightText(t, searchQuery)}</span>`).join('')}
-          </div>
-          <div class="note-excerpt">${highlightText(n.excerpt, searchQuery)}</div>
-          <div class="note-actions">
-            <button class="btn btn-primary" data-action="editTags" data-file="${escapeHtml(n.file)}">标签</button>
-            <button class="btn" data-action="addNote" data-file="${escapeHtml(n.file)}">备注</button>
-            <button class="btn btn-danger" data-action="deleteNote" data-file="${escapeHtml(n.file)}">删除</button>
-          </div>
-        </div>
-      `).join('');
-    }
-    document.getElementById('note-list').addEventListener('click', e => {
-      const note = e.target.closest('.note');
-      if (!note || e.target.closest('button')) return;
-      if (batchMode) {
-        const file = note.dataset.file;
-        if (selectedFiles.has(file)) {
-          selectedFiles.delete(file);
-        } else {
-          selectedFiles.add(file);
-        }
-        document.getElementById('selected-count').textContent = selectedFiles.size;
-        renderList(allNotes);
-      } else {
-        openNote(note.dataset.file);
-      }
-    });
     function computeListSig(notes) {
       return notes.map(n => n.file + '|' + (n.tags || []).join(',')).join('##');
     }
@@ -3052,6 +3289,7 @@ HTML = """<!DOCTYPE html>
           renderFavorites(allNotes);
           renderList(allNotes);
           renderViews();
+          loadGroups();
         }
       } catch (e) { console.error(e); }
     }
@@ -3088,11 +3326,7 @@ HTML = """<!DOCTYPE html>
       document.querySelectorAll('.view-mode-btn').forEach(btn => {
         btn.classList.toggle('active', btn.dataset.viewMode === mode);
       });
-      if (mode === 'group') {
-        loadGroups();
-      } else {
-        renderList(allNotes);
-      }
+      loadGroups();
     }
 
     let groupsCache = [];
@@ -3104,164 +3338,127 @@ HTML = """<!DOCTYPE html>
       } catch (e) { console.error(e); }
     }
 
-    function renderGroups(notes) {
+    function renderGroupView(notes) {
       const el = document.getElementById('note-list');
       const empty = document.getElementById('empty');
       const countEl = document.getElementById('note-count');
       const q = (searchQuery || '').toLowerCase();
       const tagFilter = activeTag;
-      let html = '';
-      let total = 0;
       const noteMap = {};
       notes.forEach(n => { noteMap[n.file] = n; });
-      const rendered = new Set();
-      for (const group of groupsCache) {
-        let files = group.files || [];
-        if (tagFilter) {
-          files = files.filter(f => {
-            const n = noteMap[f];
-            return n && n.tags && n.tags.includes(tagFilter);
-          });
-        }
+      const matchesFilter = n => {
+        if (!n) return false;
+        if (tagFilter && !(n.tags || []).includes(tagFilter)) return false;
         if (q) {
-          files = files.filter(f => {
-            const n = noteMap[f];
-            if (!n) return false;
-            const text = `${n.title} ${n.tags.join(' ')} ${n.excerpt} ${n.content}`.toLowerCase();
-            return text.includes(q);
-          });
+          const text = `${n.title} ${(n.tags || []).join(' ')} ${n.excerpt || ''} ${n.content || ''}`.toLowerCase();
+          if (!text.includes(q)) return false;
         }
-        const validFiles = files.filter(f => noteMap[f]);
-        total += validFiles.length;
-        html += `<div class="group-header" data-group="${escapeHtml(group.name)}" draggable="true">
+        return true;
+      };
+      let html = groupBarHtml();
+      let total = 0;
+      for (const group of groupsCache) {
+        let files = (group.files || []).filter(f => noteMap[f]);
+        files = files.filter(f => matchesFilter(noteMap[f]));
+        total += files.length;
+        html += `<div class="group-header" data-group="${escapeHtml(group.name)}">
           <span class="group-arrow">${group.collapsed ? '▸' : '▾'}</span>
           <span class="group-name">${escapeHtml(group.name)}</span>
-          <span class="group-count">${validFiles.length}</span>
+          <span class="group-count">${files.length}</span>
           <div class="group-actions">
             <button class="btn" data-action="renameGroup" data-group="${escapeHtml(group.name)}">重命名</button>
             <button class="btn btn-danger" data-action="disbandGroup" data-group="${escapeHtml(group.name)}">解散</button>
           </div>
         </div>`;
-        if (!group.collapsed && validFiles.length) {
-          html += `<div class="group-files">`;
-          for (const f of validFiles) {
-            const n = noteMap[f];
-            html += `<div class="group-file" data-file="${escapeHtml(n.file)}" draggable="true">
-              <span class="file-name">${highlightText(n.title, searchQuery)}</span>
-              <button class="btn" data-action="removeFromGroup" data-group="${escapeHtml(group.name)}" data-file="${escapeHtml(n.file)}">移出</button>
-            </div>`;
+        if (!group.collapsed) {
+          if (files.length) {
+            html += `<div class="group-files">`;
+            for (const f of files) {
+              const n = noteMap[f];
+              const extra = `<button class="btn" data-action="removeFromGroup" data-group="${escapeHtml(group.name)}" data-file="${escapeHtml(n.file)}">移出</button>`;
+              html += noteCardHtml(n, extra);
+            }
+            html += `</div>`;
+          } else if ((group.files || []).length) {
+            html += `<div class="group-files" style="color:#86868b;font-size:13px;">无匹配结果</div>`;
+          } else {
+            html += `<div class="group-files" style="color:#86868b;font-size:13px;">空组，拖入文件或勾选添加</div>`;
           }
-          html += `</div>`;
-        }
-        if (!group.collapsed && !validFiles.length && files.length) {
-          html += `<div class="group-files" style="color:#86868b;font-size:13px;">无匹配结果</div>`;
-        }
-        if (!group.collapsed && !files.length) {
-          html += `<div class="group-files" style="color:#86868b;font-size:13px;">空组，拖入文件或勾选添加</div>`;
         }
       }
-      html += `<div class="create-group-zone" data-action="createGroup">+ 新建分组</div>`;
-      html += `<div class="ungrouped-zone" data-action="ungroupedZone">未分组（拖入文件到此区域）</div>`;
-      const ungrouped = notes.filter(n => !n.group && (tagFilter ? n.tags && n.tags.includes(tagFilter) : true) && (q ? `${n.title} ${n.tags.join(' ')} ${n.excerpt} ${n.content}`.toLowerCase().includes(q) : true));
+      const ungrouped = notes.filter(n => !n.group && matchesFilter(n));
       total += ungrouped.length;
       if (ungrouped.length) {
         html += `<div style="font-size:13px;font-weight:600;color:#86868b;margin:16px 0 8px;">未分组</div>`;
         html += `<div class="group-files">`;
-        for (const n of ungrouped) {
-          html += `<div class="note ${selectedFiles.has(n.file) ? 'selected' : ''}" data-file="${escapeHtml(n.file)}" draggable="true">
-            <button class="note-star ${n.starred ? 'starred' : ''}" data-action="toggleStar" data-file="${escapeHtml(n.file)}">${n.starred ? '★' : '☆'}</button>
-            <div class="note-title">${highlightText(n.title, searchQuery)}</div>
-            <div class="note-meta"><span>${n.date} ${n.time}</span></div>
-            <div class="note-meta">${n.tags.map(t => `<span class="tag">${highlightText(t, searchQuery)}</span>`).join('')}</div>
-            <div class="note-actions">
-              <button class="btn" data-action="addToGroup" data-file="${escapeHtml(n.file)}">加入分组</button>
-            </div>
-          </div>`;
-        }
+        for (const n of ungrouped) html += noteCardHtml(n);
         html += `</div>`;
       }
+      html += `<div class="create-group-zone" data-action="createGroup">+ 新建分组</div>`;
+      html += `<div class="ungrouped-zone" data-action="ungroupedZone">未分组（拖入文件到此区域）</div>`;
       countEl.textContent = `共 ${total} 条总结`;
-      if (!total && !groupsCache.length) { el.innerHTML = ''; empty.style.display = 'block'; return; }
+      if (!total && !groupsCache.length) { el.innerHTML = groupBarHtml(); empty.style.display = 'block'; return; }
       empty.style.display = 'none';
       el.innerHTML = html;
-      setupGroupDnD();
     }
 
-    function setupGroupDnD() {
-      const el = document.getElementById('note-list');
-      let draggedFile = null;
-      el.querySelectorAll('.note[draggable="true"], .group-file[draggable="true"]').forEach(item => {
-        item.addEventListener('dragstart', e => {
-          draggedFile = item.dataset.file;
-          item.classList.add('dragging');
-          e.dataTransfer.setData('text/plain', draggedFile);
-          e.dataTransfer.effectAllowed = 'move';
-        });
-        item.addEventListener('dragend', () => {
-          item.classList.remove('dragging');
-          draggedFile = null;
-          el.querySelectorAll('.drag-over, .drag-invalid').forEach(x => {
-            x.classList.remove('drag-over', 'drag-invalid');
-          });
-        });
-      });
-      el.querySelectorAll('.group-header[draggable="true"]').forEach(header => {
-        header.addEventListener('dragover', e => {
-          e.preventDefault();
-          if (!draggedFile) return;
-          header.classList.add('drag-over');
-          header.classList.remove('drag-invalid');
-        });
-        header.addEventListener('dragleave', () => {
-          header.classList.remove('drag-over', 'drag-invalid');
-        });
-        header.addEventListener('drop', e => {
-          e.preventDefault();
-          header.classList.remove('drag-over', 'drag-invalid');
-          if (!draggedFile) return;
-          const groupName = header.dataset.group;
-          addToGroup(groupName, draggedFile);
-        });
-      });
-      const ungrouped = el.querySelector('.ungrouped-zone');
-      if (ungrouped) {
-        ungrouped.addEventListener('dragover', e => {
-          e.preventDefault();
-          if (!draggedFile) return;
-          ungrouped.classList.add('drag-over');
-        });
-        ungrouped.addEventListener('dragleave', () => {
-          ungrouped.classList.remove('drag-over');
-        });
-        ungrouped.addEventListener('drop', e => {
-          e.preventDefault();
-          ungrouped.classList.remove('drag-over');
-          if (!draggedFile) return;
-          removeFromGroup(draggedFile);
-        });
-      }
-      const createZone = el.querySelector('.create-group-zone');
-      if (createZone) {
-        createZone.addEventListener('dragover', e => {
-          e.preventDefault();
-          if (!draggedFile) return;
-          createZone.classList.add('drag-over');
-        });
-        createZone.addEventListener('dragleave', () => {
-          createZone.classList.remove('drag-over');
-        });
-        createZone.addEventListener('drop', e => {
-          e.preventDefault();
-          createZone.classList.remove('drag-over');
-          if (!draggedFile) return;
-          const name = prompt('新建分组名称：');
-          if (!name) return;
-          createGroup(name).then(() => {
-            addToGroup(name, draggedFile);
-          });
-        });
-      }
+    let draggedFile = null;
+    const DND_ZONE_SELECTOR = '.group-capsule[data-drop], .group-capsule-new, .group-header[data-group], .ungrouped-zone, .create-group-zone';
+    function clearDragMarks() {
+      draggedFile = null;
+      document.querySelectorAll('.drag-over').forEach(x => x.classList.remove('drag-over'));
+      document.querySelectorAll('.note.dragging').forEach(x => x.classList.remove('dragging'));
     }
+    document.addEventListener('dragstart', e => {
+      const item = e.target && e.target.closest ? e.target.closest('div.note[draggable="true"]') : null;
+      if (!item) return;
+      draggedFile = item.dataset.file;
+      if (item.classList) {
+        requestAnimationFrame(() => { item.classList.add('dragging'); });
+      }
+      if (e.dataTransfer) {
+        e.dataTransfer.effectAllowed = 'move';
+        try { e.dataTransfer.setData('text/plain', item.dataset.file); } catch (err) {}
+      }
+    });
+    document.addEventListener('dragend', () => clearDragMarks());
+    document.addEventListener('dragover', e => {
+      if (!draggedFile) return;
+      const zone = e.target && e.target.closest ? e.target.closest(DND_ZONE_SELECTOR) : null;
+      if (!zone) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+      const prev = document.querySelector('.drag-over');
+      if (prev && prev !== zone) prev.classList.remove('drag-over');
+      zone.classList.add('drag-over');
+    });
+    document.addEventListener('dragleave', e => {
+      const zone = e.target && e.target.closest ? e.target.closest(DND_ZONE_SELECTOR) : null;
+      if (zone) zone.classList.remove('drag-over');
+    });
+    document.addEventListener('drop', async e => {
+      if (!draggedFile) return;
+      const zone = e.target && e.target.closest ? e.target.closest(DND_ZONE_SELECTOR) : null;
+      if (!zone) return;
+      e.preventDefault();
+      zone.classList.remove('drag-over');
+      const file = draggedFile;
+      clearDragMarks();
+      if (zone.classList.contains('group-capsule') || zone.classList.contains('group-header')) {
+        const groupName = zone.dataset.group;
+        if (groupName) await addToGroup(groupName, file);
+        return;
+      }
+      if (zone.classList.contains('ungrouped-zone')) {
+        await removeFromGroup(file);
+        return;
+      }
+      const name = prompt('新建分组名称：');
+      if (!name) return;
+      const created = await createGroup(name);
+      if (created === null) return;
+      await addToGroup(created, file);
+    });
 
     async function createGroup(name) {
       const res = await fetch('/api/group/create', {
@@ -3292,11 +3489,11 @@ HTML = """<!DOCTYPE html>
       await loadGroups();
     }
 
-    async function removeFromGroup(file) {
+    async function removeFromGroup(file, groupName) {
       const res = await fetch('/api/group/remove', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({file}),
+        body: JSON.stringify(groupName ? {file, group: groupName} : {file}),
       });
       const data = await res.json();
       if (!data.ok) {
@@ -3351,6 +3548,20 @@ HTML = """<!DOCTYPE html>
       await loadGroups();
     }
 
+    async function jumpToGroup(name) {
+      setViewMode('group');
+      await loadGroups();
+      const g = groupsCache.find(x => x.name === name);
+      if (!g) return;
+      if (g.collapsed) await toggleGroup(name, false);
+      renderList(allNotes);
+      let header = null;
+      document.querySelectorAll('.group-header[data-group]').forEach(h => {
+        if (!header && h.dataset.group === name) header = h;
+      });
+      if (header) header.scrollIntoView({behavior: 'smooth', block: 'start'});
+    }
+
     function groupBySource(notes) {
       const groups = {};
       notes.forEach(n => {
@@ -3373,61 +3584,13 @@ HTML = """<!DOCTYPE html>
       return groups;
     }
 
-    function renderGroupedNotes(groups) {
-      const el = document.getElementById('note-list');
-      const empty = document.getElementById('empty');
-      const countEl = document.getElementById('note-count');
-      let html = '';
-      let total = 0;
-      for (const [group, notes] of Object.entries(groups)) {
-        total += notes.length;
-        html += `<div style="font-size:13px;font-weight:600;color:#86868b;margin:16px 0 8px;">${escapeHtml(group)}</div>`;
-        html += notes.map(n => `
-          <div class="note ${selectedFiles.has(n.file) ? 'selected' : ''}" data-file="${escapeHtml(n.file)}">
-            <button class="note-star ${n.starred ? 'starred' : ''}" data-action="toggleStar" data-file="${escapeHtml(n.file)}">${n.starred ? '★' : '☆'}</button>
-            <div class="note-title">${highlightText(n.title, searchQuery)}</div>
-            <div class="note-meta"><span>${n.date} ${n.time}</span></div>
-            <div class="note-excerpt">${highlightText(n.excerpt, searchQuery)}</div>
-          </div>
-        `).join('');
-      }
-      countEl.textContent = `共 ${total} 条总结`;
-      if (!total) { el.innerHTML = ''; empty.style.display = 'block'; return; }
-      empty.style.display = 'none';
-      el.innerHTML = html;
-    }
-
-    function renderList(notes) {
-      if (viewMode === 'source') {
-        renderGroupedNotes(groupBySource(notes));
-        return;
-      }
-      if (viewMode === 'tag') {
-        renderGroupedNotes(groupByTag(notes));
-        return;
-      }
-      if (viewMode === 'group') {
-        renderGroups(notes);
-        return;
-      }
-      const el = document.getElementById('note-list');
-      const empty = document.getElementById('empty');
-      const countEl = document.getElementById('note-count');
-      const filtered = notes.filter(n => {
-        if (activeTag && !n.tags.includes(activeTag)) return false;
-        if (searchQuery) {
-          const q = searchQuery.toLowerCase();
-          const text = `${n.title} ${n.tags.join(' ')} ${n.excerpt} ${n.content}`.toLowerCase();
-          return text.includes(q);
-        }
-        return true;
-      });
-      countEl.textContent = `共 ${filtered.length} 条总结`;
-      if (!filtered.length) { el.innerHTML = ''; empty.style.display = 'block'; return; }
-      empty.style.display = 'none';
-      el.innerHTML = filtered.map(n => `
-        <div class="note ${selectedFiles.has(n.file) ? 'selected' : ''}" data-file="${escapeHtml(n.file)}">
-          <button class="note-star ${n.starred ? 'starred' : ''}" data-action="toggleStar" data-file="${escapeHtml(n.file)}">${n.starred ? '★' : '☆'}</button>
+    function noteCardHtml(n, extraActionsHtml) {
+      const f = escapeHtml(n.file);
+      const extra = extraActionsHtml ? extraActionsHtml : '';
+      return `
+        <div class="note ${selectedFiles.has(n.file) ? 'selected' : ''}" data-file="${f}" draggable="true">
+          <button class="note-more" data-action="noteMore" data-file="${f}">⋯</button>
+          <button class="note-star ${n.starred ? 'starred' : ''}" data-action="toggleStar" data-file="${f}">${n.starred ? '★' : '☆'}</button>
           <div class="note-title">${highlightText(n.title, searchQuery)}</div>
           <div class="note-meta">
             <span>${n.date} ${n.time}</span>
@@ -3438,19 +3601,108 @@ HTML = """<!DOCTYPE html>
           </div>
           <div class="note-excerpt">${highlightText(n.excerpt, searchQuery)}</div>
           <div class="note-actions">
-            <button class="btn btn-primary" data-action="editTags" data-file="${escapeHtml(n.file)}">标签</button>
-            <button class="btn" data-action="addNote" data-file="${escapeHtml(n.file)}">备注</button>
-            <button class="btn" data-action="renameNote" data-file="${escapeHtml(n.file)}" data-symlink="${n.is_symlink ? '1' : '0'}" data-source-label="${escapeHtml(n.source_label || '')}">重命名</button>
-            <button class="btn" data-action="revealNote" data-file="${escapeHtml(n.file)}" title="在 Finder 中显示">📂</button>
-            <button class="btn btn-danger" data-action="deleteNote" data-file="${escapeHtml(n.file)}">删除</button>
-            <button class="btn" data-action="addToGroup" data-file="${escapeHtml(n.file)}">加入分组</button>
+            <button class="btn btn-primary" data-action="editTags" data-file="${f}">标签</button>
+            <button class="btn" data-action="addNote" data-file="${f}">备注</button>
+            <button class="btn" data-action="renameNote" data-file="${f}" data-symlink="${n.is_symlink ? '1' : '0'}" data-source-label="${escapeHtml(n.source_label || '')}">重命名</button>
+            <button class="btn" data-action="revealNote" data-file="${f}" title="在 Finder 中显示">📂</button>
+            <button class="btn btn-danger" data-action="deleteNote" data-file="${f}">删除</button>
+            <button class="btn" data-action="addToGroup" data-file="${f}">加入分组</button>
+            ${extra}
           </div>
-        </div>
-      `).join('');
+        </div>`;
+    }
+
+    function groupBarHtml() {
+      const capsules = groupsCache.map(g => `
+        <div class="group-capsule" data-action="jumpGroup" data-group="${escapeHtml(g.name)}" data-drop="group" title="${escapeHtml(g.name)}">
+          <span class="group-capsule-name">${escapeHtml(g.name)}</span>
+          <span class="group-capsule-count">${g.count}</span>
+        </div>`).join('');
+      return `
+        <div class="group-bar">
+          <span class="group-bar-label">分组</span>
+          ${capsules}
+          <div class="group-capsule-new" data-action="createGroup">+ 新建分组</div>
+        </div>`;
+    }
+
+    function filterNotes(notes) {
+      return notes.filter(n => {
+        if (activeTag && !(n.tags || []).includes(activeTag)) return false;
+        if (searchQuery) {
+          const q = searchQuery.toLowerCase();
+          const text = `${n.title} ${(n.tags || []).join(' ')} ${n.excerpt || ''} ${n.content || ''}`.toLowerCase();
+          return text.includes(q);
+        }
+        return true;
+      });
+    }
+
+    function findNote(file) {
+      return allNotes.find(n => n.file === file);
+    }
+
+    function groupOf(file) {
+      const g = groupsCache.find(x => (x.files || []).includes(file));
+      if (g) return g.name;
+      const n = findNote(file);
+      return n && n.group ? n.group : '';
+    }
+
+    function renderFlatView(notes) {
+      const el = document.getElementById('note-list');
+      const empty = document.getElementById('empty');
+      const countEl = document.getElementById('note-count');
+      countEl.textContent = `共 ${notes.length} 条总结`;
+      if (!notes.length) {
+        el.innerHTML = groupBarHtml();
+        empty.style.display = 'block';
+        return;
+      }
+      empty.style.display = 'none';
+      el.innerHTML = groupBarHtml() + notes.map(n => noteCardHtml(n)).join('');
+    }
+
+    function renderGroupedView(groups) {
+      const el = document.getElementById('note-list');
+      const empty = document.getElementById('empty');
+      const countEl = document.getElementById('note-count');
+      const uniq = new Set();
+      Object.values(groups).forEach(list => list.forEach(n => uniq.add(n.file)));
+      let html = groupBarHtml();
+      for (const [group, notes] of Object.entries(groups)) {
+        html += `<div style="font-size:13px;font-weight:600;color:#86868b;margin:16px 0 8px;">${escapeHtml(group)}</div>`;
+        html += notes.map(n => noteCardHtml(n)).join('');
+      }
+      countEl.textContent = `共 ${uniq.size} 条总结`;
+      if (!uniq.size) { empty.style.display = 'block'; el.innerHTML = html; return; }
+      empty.style.display = 'none';
+      el.innerHTML = html;
+    }
+
+    function renderList(notes) {
+      const filtered = filterNotes(notes);
+      if (viewMode === 'source') {
+        renderGroupedView(groupBySource(filtered));
+        return;
+      }
+      if (viewMode === 'tag') {
+        renderGroupedView(groupByTag(filtered));
+        return;
+      }
+      if (viewMode === 'group') {
+        renderGroupView(filtered);
+        return;
+      }
+      renderFlatView(filtered);
     }
 
     async function openNote(file) {
       if (!closeEditorIfDirty()) return;
+      if (!wordCheckDirty()) return;
+      readerMode = 'read';
+      updateReaderModeBar();
+      document.getElementById('reader-content').style.display = 'block';
       try {
         const res = await fetch('/api/read/html?file=' + encodeURIComponent(file));
         const html = await res.text();
@@ -3590,9 +3842,1007 @@ HTML = """<!DOCTYPE html>
     }
     function showList() {
       if (!closeEditorIfDirty()) return;
+      if (!wordCheckDirty()) return;
+      readerMode = 'read';
+      updateReaderModeBar();
       document.getElementById('reader').style.display = 'none';
       document.getElementById('note-list').style.display = 'block';
     }
+    let readerMode = 'read';
+    let wordState = {file: '', revision: null, isSymlink: false, dirty: false, sourceLabel: ''};
+    let wordConflictRevision = '';
+    let wordPendingImageRange = null;
+    let wordSaveInFlight = false;
+
+    function updateReaderModeBar() {
+      const bar = document.getElementById('reader-mode-bar');
+      if (!bar) return;
+      bar.querySelectorAll('[data-reader-mode]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.readerMode === readerMode);
+      });
+    }
+    function setWordSaveState(cls, text) {
+      const el = document.getElementById('word-save-state');
+      if (!el) return;
+      el.className = cls || '';
+      el.textContent = text || '';
+    }
+    function resetWordState() {
+      wordState = {file: '', revision: null, isSymlink: false, dirty: false, sourceLabel: ''};
+      wordConflictRevision = '';
+      wordPendingImageRange = null;
+      setWordSaveState('', '');
+      document.getElementById('word-editor-wrap').style.display = 'none';
+      document.getElementById('word-paper').innerHTML = '';
+    }
+    function wordCheckDirty() {
+      if (wordState.dirty && !confirm('Word 模式有未保存修改，确定离开？')) {
+        return false;
+      }
+      resetWordState();
+      return true;
+    }
+    async function loadWordContent(file) {
+      wordState.file = file;
+      const res = await fetch('/api/edit?file=' + encodeURIComponent(file));
+      if (!res.ok) throw new Error('edit ' + res.status);
+      const data = await res.json();
+      wordState.revision = data.revision || '';
+      wordState.isSymlink = !!data.is_symlink;
+      wordState.sourceLabel = data.source_label || '';
+      wordConflictRevision = '';
+      const htmlRes = await fetch('/api/read/html?file=' + encodeURIComponent(file));
+      if (!htmlRes.ok) throw new Error('read/html ' + htmlRes.status);
+      const html = await htmlRes.text();
+      const paper = document.getElementById('word-paper');
+      paper.innerHTML = html;
+      const boxes = paper.querySelectorAll('input[type=checkbox]');
+      for (let i = 0; i < boxes.length; i++) {
+        boxes[i].removeAttribute('disabled');
+        boxes[i].setAttribute('contenteditable', 'false');
+      }
+      wordState.dirty = false;
+      setWordSaveState('', '已加载');
+    }
+    async function setReaderMode(mode) {
+      if (mode === readerMode) return;
+      if (readerMode === 'word' && wordState.dirty) {
+        if (!confirm('Word 模式有未保存修改，确定离开？')) {
+          return;
+        }
+        resetWordState();
+      }
+      const file = document.getElementById('reader').dataset.file || '';
+      const readerContent = document.getElementById('reader-content');
+      const wordWrap = document.getElementById('word-editor-wrap');
+      if (mode === 'markdown') {
+        if (!file) return;
+        await openEditor(file);
+        readerMode = 'markdown';
+        updateReaderModeBar();
+        return;
+      }
+      if (editorOpen) closeEditorSilent();
+      readerContent.style.display = mode === 'read' ? 'block' : 'none';
+      wordWrap.style.display = mode === 'word' ? 'block' : 'none';
+      if (mode === 'word') {
+        try {
+          await loadWordContent(file);
+        } catch (e) {
+          console.error(e);
+          document.getElementById('word-paper').textContent = '内容加载失败';
+        }
+      }
+      readerMode = mode;
+      updateReaderModeBar();
+    }
+    function wordMaxBacktickRun(s) {
+      let longest = 0;
+      let run = 0;
+      s = String(s);
+      for (let i = 0; i < s.length; i++) {
+        if (s.charAt(i) === '`') {
+          run += 1;
+          if (run > longest) longest = run;
+        } else {
+          run = 0;
+        }
+      }
+      return longest;
+    }
+    function wordSafeMarkdownImageUrl(raw) {
+      const s = String(raw == null ? '' : raw).trim();
+      if (!s) return false;
+      if (s.indexOf('..') !== -1) return false;
+      if (s.indexOf('/') === 0) return false;
+      if (s.indexOf('//') === 0) return false;
+      if (!/^[a-zA-Z0-9_./-]+$/.test(s)) return false;
+      return true;
+    }
+    function wordImageMd(node) {
+      let src = node.getAttribute('src');
+      if (!src) return '';
+      src = String(src).trim();
+      const assetPrefix = '/api/asset?file=';
+      if (src.indexOf(assetPrefix) === 0) {
+        try {
+          src = decodeURIComponent(src.slice(assetPrefix.length));
+        } catch (e) {
+          return '';
+        }
+        if (!wordSafeMarkdownImageUrl(src)) return '';
+      } else {
+        const safe = wordSafeUrl(src);
+        if (!safe) return '';
+        src = safe;
+      }
+      let alt = String(node.getAttribute('alt') || '');
+      alt = alt.replace(/[\\n\\r]/g, ' ').replace(/[\\[\\]"]/g, '').trim();
+      return '![' + alt + '](' + src + ')';
+    }
+    function wordPreLines(pre) {
+      const codes = pre.getElementsByTagName('code');
+      const raw = codes.length ? String(codes[0].textContent) : String(pre.textContent);
+      const body = raw.replace(/\\n$/, '');
+      const fence = '`'.repeat(Math.max(3, wordMaxBacktickRun(body) + 1));
+      const lines = [fence];
+      if (body) lines.push(body);
+      lines.push(fence);
+      return lines;
+    }
+    function wordSerializeInline(node) {
+      let out = '';
+      const kids = node.childNodes;
+      for (let i = 0; i < kids.length; i++) {
+        out += wordInlineNode(kids[i]);
+      }
+      return out;
+    }
+    function wordInlineNode(node) {
+      if (node.nodeType === 3) {
+        return String(node.nodeValue);
+      }
+      if (node.nodeType !== 1) return '';
+      const tag = String(node.tagName).toLowerCase();
+      if (WORD_DANGEROUS_TAGS[tag]) return '';
+      if (tag === 'br') return '\\n';
+      if (tag === 'img') return wordImageMd(node);
+      if (tag === 'input') return '';
+      if (tag === 'code') {
+        const t = String(node.textContent);
+        if (!t) return '';
+        const fence = '`'.repeat(Math.max(1, wordMaxBacktickRun(t) + 1));
+        return fence + t + fence;
+      }
+      if (tag === 'pre') {
+        return wordPreLines(node).join('\\n');
+      }
+      if (tag === 'a') {
+        const text = wordSerializeInline(node).trim();
+        if (!text) return '';
+        const url = wordSafeUrl(node.getAttribute('href'));
+        return url ? ('[' + text + '](' + url + ')') : text;
+      }
+      if (tag === 'strong' || tag === 'b') {
+        const inner = wordSerializeInline(node).trim();
+        if (!inner) return '';
+        return '**' + inner + '**';
+      }
+      if (tag === 'em' || tag === 'i') {
+        const inner = wordSerializeInline(node).trim();
+        if (!inner) return '';
+        return '*' + inner + '*';
+      }
+      return wordSerializeInline(node);
+    }
+    function wordTableCellText(cell) {
+      let t = String(wordSerializeInline(cell));
+      t = t.replace(/\\n/g, ' ');
+      t = t.replace(/ {2,}/g, ' ');
+      t = t.replace(/\\|/g, '\\\\|');
+      return t.trim();
+    }
+    function wordTableLines(table) {
+      const thead = table.tHead;
+      let headerTr = thead && thead.rows.length ? thead.rows[0] : null;
+      const bodyTrs = [];
+      const tbodies = table.tBodies;
+      for (let i = 0; i < tbodies.length; i++) {
+        const rows = tbodies[i].rows;
+        for (let j = 0; j < rows.length; j++) bodyTrs.push(rows[j]);
+      }
+      if (!headerTr && bodyTrs.length === 0) {
+        const all = table.rows;
+        for (let i = 0; i < all.length; i++) bodyTrs.push(all[i]);
+      }
+      if (!headerTr && bodyTrs.length === 0) return [];
+      const headerRow = headerTr || bodyTrs[0];
+      const bodyRows = headerTr ? bodyTrs : bodyTrs.slice(1);
+      const headerCells = Array.prototype.slice.call(headerRow.cells);
+      const width = Math.max(headerCells.length, 1);
+      const padCells = function(cells) {
+        const arr = [];
+        for (let i = 0; i < width; i++) {
+          arr.push(cells[i] ? wordTableCellText(cells[i]) : '');
+        }
+        return arr;
+      };
+      const lines = ['| ' + padCells(headerCells).join(' | ') + ' |'];
+      let sep = '|';
+      for (let i = 0; i < width; i++) sep += ' --- |';
+      lines.push(sep);
+      for (let r = 0; r < bodyRows.length; r++) {
+        lines.push('| ' + padCells(bodyRows[r].cells).join(' | ') + ' |');
+      }
+      return lines;
+    }
+    function wordLiLines(li, ordered, depth, index) {
+      let checkbox = null;
+      const inputs = li.getElementsByTagName('input');
+      for (let i = 0; i < inputs.length; i++) {
+        if (String(inputs[i].type || '').toLowerCase() === 'checkbox') {
+          checkbox = inputs[i];
+          break;
+        }
+      }
+      let inline = '';
+      const nested = [];
+      const kids = li.childNodes;
+      for (let i = 0; i < kids.length; i++) {
+        const c = kids[i];
+        if (c === checkbox) continue;
+        if (c.nodeType === 1) {
+          const ct = String(c.tagName).toLowerCase();
+          if (ct === 'ul' || ct === 'ol') {
+            nested.push(c);
+            continue;
+          }
+        }
+        inline += wordInlineNode(c);
+      }
+      inline = inline.replace(/\\n/g, ' ').replace(/ {2,}/g, ' ').trim();
+      const marker = checkbox
+        ? (checkbox.checked === true ? '- [x] ' : '- [ ] ')
+        : (ordered ? (index + '. ') : '- ');
+      const indent = '  '.repeat(depth);
+      const lines = [(indent + marker + inline).replace(/ +$/, '')];
+      for (let j = 0; j < nested.length; j++) {
+        const nl = wordListLines(nested[j], String(nested[j].tagName).toLowerCase() === 'ol', depth + 1);
+        if (nl) lines.push.apply(lines, nl);
+      }
+      return lines.length ? lines : null;
+    }
+    function wordListLines(listEl, ordered, depth) {
+      const lines = [];
+      const kids = listEl.childNodes;
+      let index = 0;
+      for (let i = 0; i < kids.length; i++) {
+        const li = kids[i];
+        if (li.nodeType !== 1 || String(li.tagName).toLowerCase() !== 'li') continue;
+        index += 1;
+        const liLines = wordLiLines(li, ordered, depth, index);
+        if (liLines) lines.push.apply(lines, liLines);
+      }
+      return lines.length ? lines : null;
+    }
+    function wordSplitBlockText(text) {
+      const parts = String(text).split('\\n');
+      let first = -1;
+      let last = -1;
+      for (let j = 0; j < parts.length; j++) {
+        const t = parts[j].replace(/ {2,}/g, ' ').trim();
+        parts[j] = t;
+        if (t) {
+          if (first === -1) first = j;
+          last = j;
+        }
+      }
+      if (first === -1) return [];
+      return parts.slice(first, last + 1);
+    }
+    function wordQuoteLines(bq) {
+      const lines = [];
+      const kids = bq.childNodes;
+      for (let i = 0; i < kids.length; i++) {
+        const c = kids[i];
+        if (c.nodeType === 3) {
+          const parts = c.nodeValue.split('\\n');
+          for (let j = 0; j < parts.length; j++) {
+            const t = parts[j].trim();
+            if (t) lines.push(t);
+          }
+          continue;
+        }
+        if (c.nodeType !== 1) continue;
+        const tag = String(c.tagName).toLowerCase();
+        if (WORD_DANGEROUS_TAGS[tag]) continue;
+        if (tag === 'pre') {
+          const pl = wordPreLines(c);
+          for (let j = 0; j < pl.length; j++) lines.push(pl[j]);
+          continue;
+        }
+        if (tag === 'table') {
+          const tl = wordTableLines(c);
+          for (let j = 0; j < tl.length; j++) lines.push(tl[j]);
+          continue;
+        }
+        if (tag === 'ul' || tag === 'ol') {
+          const ll = wordListLines(c, tag === 'ol', 0);
+          if (ll) {
+            for (let j = 0; j < ll.length; j++) lines.push(ll[j]);
+          }
+          continue;
+        }
+        const qparts = wordSplitBlockText(wordSerializeInline(c));
+        for (let j = 0; j < qparts.length; j++) lines.push(qparts[j]);
+      }
+      const out = [];
+      for (let i = 0; i < lines.length; i++) out.push(lines[i] ? ('> ' + lines[i]) : '>');
+      return out.length ? out : null;
+    }
+    function wordComposePBlock(node) {
+      const lines = [];
+      let buf = '';
+      const flush = function() {
+        lines.push.apply(lines, wordSplitBlockText(buf));
+        buf = '';
+      };
+      const kids = node.childNodes;
+      for (let i = 0; i < kids.length; i++) {
+        const c = kids[i];
+        if (c.nodeType === 3) {
+          buf += c.nodeValue;
+          continue;
+        }
+        if (c.nodeType !== 1) continue;
+        const tag = String(c.tagName).toLowerCase();
+        if (WORD_DANGEROUS_TAGS[tag]) continue;
+        if (tag === 'img') {
+          flush();
+          const md = wordImageMd(c);
+          if (md) lines.push(md);
+          continue;
+        }
+        if (tag === 'pre') {
+          flush();
+          const pl = wordPreLines(c);
+          for (let j = 0; j < pl.length; j++) lines.push(pl[j]);
+          continue;
+        }
+        buf += wordInlineNode(c);
+      }
+      flush();
+      return lines;
+    }
+    function wordBlockToLines(node) {
+      if (node.nodeType === 3) {
+        const parts = node.nodeValue.split('\\n');
+        const lines = [];
+        for (let i = 0; i < parts.length; i++) {
+          const t = parts[i].trim();
+          if (t) lines.push(t);
+        }
+        return lines.length ? lines : null;
+      }
+      if (node.nodeType !== 1) return null;
+      const tag = String(node.tagName).toLowerCase();
+      if (WORD_DANGEROUS_TAGS[tag]) return null;
+      if (tag === 'br') return null;
+      if (tag === 'pre') { const l = wordPreLines(node); return l.length ? l : null; }
+      if (tag === 'table') { const l = wordTableLines(node); return l.length ? l : null; }
+      if (tag === 'ul' || tag === 'ol') { const l = wordListLines(node, tag === 'ol', 0); return l ? l : null; }
+      if (tag === 'blockquote') { const l = wordQuoteLines(node); return l ? l : null; }
+      if (tag === 'img') { const md = wordImageMd(node); return md ? [md] : null; }
+      if (/^h[1-6]$/.test(tag)) {
+        const t = wordSerializeInline(node).replace(/\\n/g, ' ').trim();
+        if (!t) return null;
+        return [('#'.repeat(parseInt(tag.charAt(1), 10)) + ' ' + t)];
+      }
+      if (tag === 'p') {
+        const lines = wordComposePBlock(node);
+        return lines.length ? lines : null;
+      }
+      if (WORD_CONTAINER_TAGS[tag]) {
+        const memberLines = [];
+        const ckids = node.childNodes;
+        for (let i = 0; i < ckids.length; i++) {
+          const cl = wordBlockToLines(ckids[i]);
+          if (cl) memberLines.push(cl);
+        }
+        const lines = [];
+        for (let j = 0; j < memberLines.length; j++) {
+          if (j > 0) lines.push('');
+          lines.push.apply(lines, memberLines[j]);
+        }
+        return lines.length ? lines : null;
+      }
+      const t = wordSerializeInline(node).replace(/\\n/g, ' ').trim();
+      return t ? [t] : null;
+    }
+    function wordSerializeToMarkdown() {
+      const paper = document.getElementById('word-paper');
+      const blocks = [];
+      const kids = paper.childNodes;
+      for (let i = 0; i < kids.length; i++) {
+        const l = wordBlockToLines(kids[i]);
+        if (l) blocks.push(l);
+      }
+      let out = '';
+      for (let i = 0; i < blocks.length; i++) {
+        if (out) out += '\\n\\n';
+        out += blocks[i].join('\\n');
+      }
+      out = out.replace(/\\n\\s*$/, '');
+      if (out) out += '\\n';
+      return out;
+    }
+    function wordSymlinkPrompt() {
+      const label = wordState.sourceLabel || '源文件';
+      showModal('确认写入源文件', '「' + label + '」为软链接，保存将直接修改源文件内容。是否继续？', [
+        {text: '取消', class: 'btn', action: function() {
+          closeModal();
+        }},
+        {text: '继续保存', class: 'btn btn-primary', action: async function() {
+          closeModal();
+          await saveWord(true);
+        }},
+      ]);
+    }
+    async function saveWord(propagateConfirmed) {
+      if (wordSaveInFlight) return;
+      if (!wordState.file || wordState.revision === null) return;
+      if (!wordState.dirty) {
+        setWordSaveState('saved', '已保存');
+        return;
+      }
+      if (wordState.isSymlink && propagateConfirmed !== true) {
+        wordSymlinkPrompt();
+        return;
+      }
+      wordSaveInFlight = true;
+      const file = wordState.file;
+      const content = wordSerializeToMarkdown();
+      const propagate = wordState.isSymlink && propagateConfirmed === true;
+      const revision = wordConflictRevision || wordState.revision;
+      setWordSaveState('saving', '保存中…');
+      try {
+        const res = await fetch('/api/save', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({file: file, content: content, revision: revision, propagate: propagate}),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          if (data.conflict) {
+            wordConflictRevision = data.revision || '';
+            setWordSaveState('conflict', '保存冲突：文件已被外部修改');
+            showWordConflictModal();
+            return;
+          }
+          if (data.symlink && data.requires_propagate) {
+            wordSymlinkPrompt();
+            return;
+          }
+          setWordSaveState('error', data.error || '保存失败');
+          return;
+        }
+        wordState.revision = data.revision || revision;
+        wordConflictRevision = '';
+        wordState.dirty = false;
+        setWordSaveState('saved', '已保存 ' + new Date().toLocaleTimeString());
+        refreshWordReader(file);
+      } catch (e) {
+        setWordSaveState('error', '保存失败：网络错误');
+      } finally {
+        wordSaveInFlight = false;
+      }
+    }
+    function showWordConflictModal() {
+      showModal('保存冲突', '文件已在外部被修改，当前修改尚未保存。可重新加载最新版本（放弃当前修改），或用最新 revision 覆盖保存。', [
+        {text: '取消', class: 'btn', action: function() {
+          closeModal();
+          setWordSaveState('dirty', '有未保存的更改');
+        }},
+        {text: '重新加载', class: 'btn', action: async function() {
+          const file = wordState.file;
+          closeModal();
+          wordConflictRevision = '';
+          try {
+            await loadWordContent(file);
+          } catch (e) {
+            setWordSaveState('error', '重新加载失败');
+            return;
+          }
+          refreshWordReader(file);
+        }},
+        {text: '覆盖保存', class: 'btn btn-primary', action: async function() {
+          const symlink = wordState.isSymlink;
+          closeModal();
+          await saveWord(symlink);
+        }},
+      ]);
+    }
+    async function refreshWordReader(file) {
+      try {
+        const res = await fetch('/api/read/html?file=' + encodeURIComponent(file));
+        if (res.ok) {
+          document.getElementById('reader-content').innerHTML = await res.text();
+        }
+      } catch (e) {}
+      loadList();
+    }
+    document.getElementById('word-paper').addEventListener('input', () => {
+      wordMarkDirty();
+    });
+    document.getElementById('word-paper').addEventListener('change', e => {
+      const t = e.target;
+      if (t && String(t.tagName).toLowerCase() === 'input' && String(t.type).toLowerCase() === 'checkbox') {
+        wordMarkDirty();
+      }
+    });
+    const WORD_IMG_TYPES = { 'image/png': 1, 'image/jpeg': 1, 'image/gif': 1, 'image/webp': 1 };
+    const WORD_IMG_EXT_MIMES = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp' };
+    const WORD_BLOCK_TAGS = { p: 1, h1: 1, h2: 1, h3: 1, h4: 1, pre: 1, blockquote: 1, li: 1 };
+    const WORD_PASTE_TAGS = { h1: 1, h2: 1, h3: 1, h4: 1, p: 1, br: 1, ul: 1, ol: 1, li: 1, blockquote: 1, pre: 1, code: 1, table: 1, thead: 1, tbody: 1, tr: 1, th: 1, td: 1, strong: 1, b: 1, em: 1, i: 1, a: 1, img: 1, input: 1 };
+    const WORD_DANGEROUS_TAGS = { script: 1, style: 1, iframe: 1, object: 1, embed: 1, link: 1, meta: 1, base: 1, form: 1, noscript: 1, template: 1, svg: 1, math: 1 };
+    const WORD_CONTAINER_TAGS = { div: 1, section: 1, article: 1, main: 1, header: 1, footer: 1, nav: 1, aside: 1 };
+
+    function wordMarkDirty() {
+      if (!wordState.file) return;
+      wordState.dirty = true;
+      setWordSaveState('dirty', '有未保存的更改');
+    }
+
+    function wordSafeUrl(raw) {
+      const s = String(raw == null ? '' : raw).trim();
+      if (!s) return null;
+      const lower = s.toLowerCase();
+      if (lower.indexOf('http://') === 0) return s;
+      if (lower.indexOf('https://') === 0) return s;
+      if (lower.indexOf('mailto:') === 0) return s;
+      if (s.charAt(0) === '/' && s.charAt(1) !== '/') return s;
+      return null;
+    }
+
+    function wordEnsureSelection() {
+      const paper = document.getElementById('word-paper');
+      const sel = window.getSelection();
+      let moved = !sel.rangeCount;
+      if (!moved && !paper.contains(sel.getRangeAt(0).commonAncestorContainer)) moved = true;
+      if (moved) {
+        paper.focus();
+        const r = document.createRange();
+        r.selectNodeContents(paper);
+        r.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(r);
+      }
+    }
+
+    function wordFindBlock(range, paper) {
+      let node = range.startContainer;
+      if (node.nodeType === 3) node = node.parentNode;
+      while (node && node !== paper) {
+        if (node.nodeType === 1 && WORD_BLOCK_TAGS[String(node.tagName).toLowerCase()]) return node;
+        node = node.parentNode;
+      }
+      return null;
+    }
+
+    function wordFormatBlock(tag) {
+      const lower = String(tag).toLowerCase();
+      let ok = false;
+      try {
+        ok = !!document.execCommand('formatBlock', false, '<' + lower + '>');
+      } catch (e) {
+        ok = false;
+      }
+      if (ok) return;
+      const sel = window.getSelection();
+      if (!sel.rangeCount) return;
+      const range = sel.getRangeAt(0);
+      const paper = document.getElementById('word-paper');
+      const el = document.createElement(lower);
+      const block = wordFindBlock(range, paper);
+      if (block && block.parentNode) {
+        while (block.firstChild) el.appendChild(block.firstChild);
+        block.parentNode.replaceChild(el, block);
+      } else {
+        range.deleteContents();
+        range.insertNode(el);
+      }
+      const r2 = document.createRange();
+      r2.selectNodeContents(el);
+      sel.removeAllRanges();
+      sel.addRange(r2);
+    }
+
+    function wordInsertInlineCode() {
+      const sel = window.getSelection();
+      if (!sel.rangeCount) return;
+      const range = sel.getRangeAt(0);
+      const text = range.toString();
+      const code = document.createElement('code');
+      code.textContent = text;
+      range.deleteContents();
+      range.insertNode(code);
+      const r2 = document.createRange();
+      if (text) {
+        r2.selectNodeContents(code);
+        r2.collapse(false);
+      } else {
+        const caretText = code.appendChild(document.createTextNode(''));
+        r2.setStart(caretText, 0);
+        r2.setEnd(caretText, 0);
+      }
+      sel.removeAllRanges();
+      sel.addRange(r2);
+    }
+
+    function wordInsertLink() {
+      const raw = window.prompt('链接地址（http://、https://、mailto: 或 / 开头的相对路径）', '');
+      if (raw == null || !String(raw).trim()) return;
+      const url = wordSafeUrl(raw);
+      if (!url) {
+        window.alert('不安全的链接地址已忽略。仅允许 http://、https://、mailto: 或 / 开头的相对路径');
+        return;
+      }
+      const sel = window.getSelection();
+      if (!sel.rangeCount) return;
+      const range = sel.getRangeAt(0);
+      if (!range.collapsed && range.toString()) {
+        document.execCommand('createLink', false, url);
+        return;
+      }
+      const a = document.createElement('a');
+      a.setAttribute('href', url);
+      a.textContent = '链接';
+      range.deleteContents();
+      range.insertNode(a);
+      const r2 = document.createRange();
+      r2.selectNodeContents(a);
+      r2.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(r2);
+    }
+
+    function wordInsertTaskList() {
+      const sel = window.getSelection();
+      if (!sel.rangeCount) return;
+      const range = sel.getRangeAt(0);
+      const ul = document.createElement('ul');
+      const li = document.createElement('li');
+      const input = document.createElement('input');
+      input.type = 'checkbox';
+      input.setAttribute('contenteditable', 'false');
+      li.appendChild(input);
+      li.appendChild(document.createTextNode(range.toString()));
+      ul.appendChild(li);
+      range.deleteContents();
+      range.insertNode(ul);
+      const r2 = document.createRange();
+      r2.selectNodeContents(li);
+      r2.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(r2);
+    }
+
+    function wordInsertTable() {
+      const sel = window.getSelection();
+      if (!sel.rangeCount) return;
+      const range = sel.getRangeAt(0);
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      const htr = document.createElement('tr');
+      const th1 = document.createElement('th');
+      th1.textContent = '列一';
+      const th2 = document.createElement('th');
+      th2.textContent = '列二';
+      htr.appendChild(th1);
+      htr.appendChild(th2);
+      thead.appendChild(htr);
+      const tbody = document.createElement('tbody');
+      const btr = document.createElement('tr');
+      const td1 = document.createElement('td');
+      const td2 = document.createElement('td');
+      btr.appendChild(td1);
+      btr.appendChild(td2);
+      tbody.appendChild(btr);
+      table.appendChild(thead);
+      table.appendChild(tbody);
+      range.deleteContents();
+      range.insertNode(table);
+      const r2 = document.createRange();
+      r2.selectNodeContents(td1);
+      r2.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r2);
+    }
+
+    function wordInsertCodeBlock() {
+      const sel = window.getSelection();
+      if (!sel.rangeCount) return;
+      const paper = document.getElementById('word-paper');
+      const range = sel.getRangeAt(0);
+      const text = range.toString();
+      let ok = false;
+      try {
+        ok = !!document.execCommand('formatBlock', false, '<pre>');
+      } catch (e) {
+        ok = false;
+      }
+      let pre = null;
+      if (ok) {
+        const s2 = window.getSelection();
+        if (s2.rangeCount) {
+          let node = s2.getRangeAt(0).startContainer;
+          if (node.nodeType === 3) node = node.parentNode;
+          while (node && node !== paper) {
+            if (node.nodeType === 1 && String(node.tagName).toLowerCase() === 'pre') {
+              pre = node;
+              break;
+            }
+            node = node.parentNode;
+          }
+        }
+      }
+      if (pre) {
+        const code = document.createElement('code');
+        code.textContent = text;
+        while (pre.firstChild) pre.removeChild(pre.firstChild);
+        pre.appendChild(code);
+        const r2 = document.createRange();
+        r2.selectNodeContents(code);
+        r2.collapse(false);
+        sel.removeAllRanges();
+        sel.addRange(r2);
+        return;
+      }
+      const fallback = document.createElement('pre');
+      const code2 = document.createElement('code');
+      code2.textContent = text;
+      fallback.appendChild(code2);
+      range.deleteContents();
+      range.insertNode(fallback);
+      const r3 = document.createRange();
+      r3.selectNodeContents(code2);
+      r3.collapse(false);
+      sel.removeAllRanges();
+      sel.addRange(r3);
+    }
+
+    function wordCommand(action) {
+      wordEnsureSelection();
+      switch (action) {
+        case 'bold': document.execCommand('bold'); break;
+        case 'italic': document.execCommand('italic'); break;
+        case 'unordered-list': document.execCommand('insertUnorderedList'); break;
+        case 'ordered-list': document.execCommand('insertOrderedList'); break;
+        case 'paragraph': wordFormatBlock('p'); break;
+        case 'h1': wordFormatBlock('h1'); break;
+        case 'h2': wordFormatBlock('h2'); break;
+        case 'h3': wordFormatBlock('h3'); break;
+        case 'quote': wordFormatBlock('blockquote'); break;
+        case 'codeblock': wordInsertCodeBlock(); break;
+        case 'inline-code': wordInsertInlineCode(); break;
+        case 'link': wordInsertLink(); break;
+        case 'task-list': wordInsertTaskList(); break;
+        case 'table': wordInsertTable(); break;
+        default: return;
+      }
+      wordMarkDirty();
+    }
+
+    function wordSanitizeNode(node) {
+      if (node.nodeType === 3) return document.createTextNode(node.nodeValue);
+      if (node.nodeType !== 1) return null;
+      const tag = String(node.tagName).toLowerCase();
+      if (WORD_DANGEROUS_TAGS[tag]) return null;
+      if (!WORD_PASTE_TAGS[tag]) {
+        const frag = document.createDocumentFragment();
+        Array.prototype.slice.call(node.childNodes).forEach(child => {
+          const kept = wordSanitizeNode(child);
+          if (kept) frag.appendChild(kept);
+        });
+        return frag;
+      }
+      if (tag === 'img') {
+        const src = wordSafeUrl(node.getAttribute('src'));
+        if (!src) return null;
+        const img = document.createElement('img');
+        img.setAttribute('src', src);
+        const alt = node.getAttribute('alt');
+        if (alt) img.setAttribute('alt', alt);
+        return img;
+      }
+      const el = document.createElement(tag);
+      if (tag === 'a') {
+        const href = wordSafeUrl(node.getAttribute('href'));
+        if (href) el.setAttribute('href', href);
+      } else if (tag === 'input') {
+        if (String(node.getAttribute('type') || '').toLowerCase() !== 'checkbox') return null;
+        el.setAttribute('type', 'checkbox');
+        el.setAttribute('contenteditable', 'false');
+        el.checked = !!node.checked;
+        return el;
+      }
+      Array.prototype.slice.call(node.childNodes).forEach(child => {
+        const kept = wordSanitizeNode(child);
+        if (kept) el.appendChild(kept);
+      });
+      return el;
+    }
+
+    function wordPasteHtml(html, plainText) {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      const paper = document.getElementById('word-paper');
+      const sel = window.getSelection();
+      let range;
+      if (sel.rangeCount && paper.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+        range = sel.getRangeAt(0);
+      } else {
+        range = document.createRange();
+        range.selectNodeContents(paper);
+        range.collapse(false);
+      }
+      const fragment = document.createDocumentFragment();
+      Array.prototype.slice.call(doc.body.childNodes).forEach(child => {
+        const kept = wordSanitizeNode(child);
+        if (kept) fragment.appendChild(kept);
+      });
+      if (!fragment.childNodes.length) {
+        if (plainText) {
+          sel.removeAllRanges();
+          sel.addRange(range);
+          document.execCommand('insertText', false, plainText);
+          wordMarkDirty();
+        }
+        return;
+      }
+      const last = fragment.childNodes[fragment.childNodes.length - 1];
+      range.deleteContents();
+      range.insertNode(fragment);
+      const r2 = document.createRange();
+      r2.setStartAfter(last);
+      r2.collapse(true);
+      sel.removeAllRanges();
+      sel.addRange(r2);
+      wordMarkDirty();
+    }
+
+    function wordInsertImageNode(url, fileName, savedRange) {
+      const paper = document.getElementById('word-paper');
+      const alt = fileName.split('[').join('').split(']').join('').split('(').join('').split(')').join('').trim() || '图片';
+      let src = String(url || '').trim();
+      if (src && !wordSafeUrl(src)) {
+        if (!wordSafeMarkdownImageUrl(src)) return;
+        src = '/api/asset?file=' + encodeURIComponent(src);
+      }
+      let range;
+      if (savedRange && paper.contains(savedRange.commonAncestorContainer)) {
+        range = savedRange;
+      } else {
+        const sel0 = window.getSelection();
+        if (sel0.rangeCount && paper.contains(sel0.getRangeAt(0).commonAncestorContainer)) {
+          range = sel0.getRangeAt(0);
+        } else {
+          range = document.createRange();
+          range.selectNodeContents(paper);
+          range.collapse(false);
+        }
+      }
+      const img = document.createElement('img');
+      img.setAttribute('src', src);
+      img.setAttribute('alt', alt);
+      range.deleteContents();
+      range.insertNode(img);
+      if (savedRange === wordPendingImageRange) wordPendingImageRange = null;
+      const r2 = document.createRange();
+      r2.setStartAfter(img);
+      r2.collapse(true);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(r2);
+      wordMarkDirty();
+    }
+
+    async function wordUploadImage(file, savedRange) {
+      if (!file) return;
+      const fileName = String(file.name || '');
+      const dot = fileName.lastIndexOf('.');
+      const ext = dot >= 0 ? fileName.slice(dot + 1).toLowerCase() : '';
+      const mime = WORD_IMG_TYPES[file.type] ? file.type : (WORD_IMG_EXT_MIMES[ext] || '');
+      if (!mime) return;
+      let dataUrl = '';
+      try {
+        dataUrl = await new Promise(function(resolve) {
+          const reader = new FileReader();
+          reader.onload = function() { resolve(reader.result); };
+          reader.onerror = function() { resolve(''); };
+          reader.readAsDataURL(file);
+        });
+      } catch (e) {
+        dataUrl = '';
+      }
+      if (!dataUrl || String(dataUrl).indexOf('base64,') === -1) {
+        flashFeedback('读取图片失败');
+        return;
+      }
+      const b64 = String(dataUrl).split('base64,')[1];
+      try {
+        const res = await fetch('/api/upload', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({file: wordState.file, data: b64, mime: mime, filename: fileName}),
+        });
+        if (!res.ok) {
+          flashFeedback('图片上传失败');
+          return;
+        }
+        const data = await res.json();
+        if (!data.ok || !data.url) {
+          flashFeedback('图片上传失败');
+          return;
+        }
+        wordInsertImageNode(data.url, fileName, savedRange);
+      } catch (e) {
+        flashFeedback('图片上传失败');
+      }
+    }
+
+    const wordToolbarEl = document.getElementById('word-toolbar');
+    wordToolbarEl.addEventListener('mousedown', e => {
+      e.preventDefault();
+    });
+    wordToolbarEl.addEventListener('click', e => {
+      const btn = e.target.closest('[data-word-action]');
+      if (!btn) return;
+      const action = btn.dataset.wordAction;
+      if (action === 'image') {
+        const sel = window.getSelection();
+        const paper = document.getElementById('word-paper');
+        wordPendingImageRange = (sel.rangeCount && paper.contains(sel.getRangeAt(0).commonAncestorContainer)) ? sel.getRangeAt(0).cloneRange() : null;
+        document.getElementById('word-image-input').click();
+        return;
+      }
+      wordCommand(action);
+    });
+    document.getElementById('word-image-input').addEventListener('change', e => {
+      const files = Array.from(e.target.files || []);
+      files.forEach(f => wordUploadImage(f, wordPendingImageRange));
+      e.target.value = '';
+    });
+    document.getElementById('word-paper').addEventListener('paste', e => {
+      const cd = e.clipboardData;
+      if (!cd) return;
+      const items = cd.items ? Array.from(cd.items) : [];
+      const imgFiles = [];
+      items.forEach(item => {
+        if (item.kind !== 'file') return;
+        const f = item.getAsFile();
+        if (!f || !f.type) return;
+        const t = String(f.type).toLowerCase();
+        if (t === 'image/png' || t === 'image/jpeg' || t === 'image/gif' || t === 'image/webp') imgFiles.push(f);
+      });
+      if (imgFiles.length) {
+        e.preventDefault();
+        const sel = window.getSelection();
+        const savedRange = sel.rangeCount ? sel.getRangeAt(0).cloneRange() : null;
+        imgFiles.forEach(f => wordUploadImage(f, savedRange));
+        return;
+      }
+      const html = cd.getData('text/html');
+      if (html) {
+        e.preventDefault();
+        wordPasteHtml(html, cd.getData('text/plain'));
+        return;
+      }
+      const text = cd.getData('text/plain');
+      if (!text) return;
+      e.preventDefault();
+      document.execCommand('insertText', false, text);
+      wordMarkDirty();
+    });
     function toggleTag(tag) {
       activeTag = activeTag === tag ? null : tag;
       renderList(allNotes);
@@ -3670,29 +4920,17 @@ HTML = """<!DOCTYPE html>
       saveNote(file, input);
     }
     async function saveNote(file, text) {
-      const index = await fetch('/api/views').then(r => r.json());
-      const key = `_note_${file}`;
-      if (!index[key]) {
-        await fetch('/api/views/save', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({name: key, filters: {}})
-        });
-      }
-      await fetch('/api/tags', {
+      const note = allNotes.find(n => n.file === file);
+      const res = await fetch('/api/tags', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({file, tags: allNotes.find(n => n.file === file)?.tags || []})
+        body: JSON.stringify({file, tags: note ? (note.tags || []) : [], note: text || ''})
       });
-      const idx = await (await fetch('/api/views')).json();
-      const entry = idx[key] || {};
-      entry.note = text;
-      entry.updated_at = new Date().toISOString();
-      await fetch('/api/views/save', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({name: key, filters: entry})
-      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data.ok) return;
+      if (note) note.note = text || '';
+      renderList(allNotes);
     }
     function deleteNote(file) {
       showModal('确认删除', '确定要删除这条总结吗？原始文件不会被删除（软链接仅移除链接）。', [
@@ -3710,6 +4948,7 @@ HTML = """<!DOCTYPE html>
       renderList(allNotes);
       renderTags(allNotes);
       closeModal();
+      loadGroups();
     }
     function toggleBatch() {
       batchMode = !batchMode;
@@ -3774,6 +5013,7 @@ HTML = """<!DOCTYPE html>
           renderList(allNotes);
           renderTags(allNotes);
           closeModal();
+          loadGroups();
         }}
       ]);
     }
@@ -3978,6 +5218,15 @@ HTML = """<!DOCTYPE html>
     function exitToBack() {
       if (!closeEditorIfDirty()) return;
       showList();
+    }
+    function backToReader() {
+      if (!closeEditorIfDirty()) return;
+      const file = editorFile;
+      if (!file) {
+        showList();
+        return;
+      }
+      openNote(file);
     }
     async function openEditor(file) {
       if (editorOpen && editorDirty && !confirm('当前笔记有未保存更改，打开其他笔记将放弃这些更改')) {
@@ -4282,6 +5531,7 @@ HTML = """<!DOCTYPE html>
       if (!btn) return;
       const action = btn.dataset.edit;
       if (action === 'back') exitToBack();
+      else if (action === 'back-reader') backToReader();
       else if (action === 'save') saveEditor();
       else if (action === 'cancel') cancelEdit();
       else if (action === 'reload') { if (editorFile) openEditor(editorFile); }
@@ -4304,15 +5554,252 @@ HTML = """<!DOCTYPE html>
         if (editorOpen) {
           e.preventDefault();
           saveEditor();
+        } else if (readerMode === 'word') {
+          e.preventDefault();
+          saveWord();
         }
       }
     });
     window.addEventListener('beforeunload', e => {
-      if (editorOpen && editorDirty) {
+      if ((editorOpen && editorDirty) || (readerMode === 'word' && wordState.dirty)) {
         e.preventDefault();
         e.returnValue = '';
       }
     });
+    let ctxNoteFile = null;
+    let ctxGroup = null;
+    let ctxSubTimer = null;
+    function closeCtxMenu() {
+      const menu = document.getElementById('ctx-menu');
+      menu.style.display = 'none';
+      menu.innerHTML = '';
+      ctxNoteFile = null;
+      ctxGroup = null;
+      if (ctxSubTimer) {
+        clearTimeout(ctxSubTimer);
+        ctxSubTimer = null;
+      }
+    }
+    function positionCtxMenu(menu, x, y) {
+      menu.style.display = 'block';
+      menu.style.visibility = 'hidden';
+      menu.style.left = '0px';
+      menu.style.top = '0px';
+      const w = menu.offsetWidth;
+      const h = menu.offsetHeight;
+      let px = x + 6;
+      let py = y + 6;
+      if (px + w > window.innerWidth - 8) px = Math.max(8, x - w - 6);
+      if (py + h > window.innerHeight - 8) py = Math.max(8, y - h - 6);
+      menu.style.left = px + 'px';
+      menu.style.top = py + 'px';
+      menu.style.visibility = 'visible';
+    }
+    function openNoteCtxAt(file, x, y) {
+      closeCtxMenu();
+      const note = findNote(file);
+      if (!note) return;
+      ctxNoteFile = file;
+      const menu = document.getElementById('ctx-menu');
+      const groupName = groupOf(file);
+      const starLabel = note.starred ? '取消星标' : '星标';
+      const groupItems = groupsCache.length
+        ? groupsCache.map(g => `<div class="ctx-item" data-ctxid="group-add" data-group="${escapeHtml(g.name)}"><span class="ctx-label">${escapeHtml(g.name)}</span></div>`).join('')
+        : `<div class="ctx-item ctx-disabled ctx-hint"><span class="ctx-label">暂无分组</span></div>`;
+      const removeItem = groupName
+        ? `<div class="ctx-item ctx-danger" data-ctxid="group-out"><span class="ctx-icon">⊖</span><span class="ctx-label">移出 ${escapeHtml(groupName)}</span></div>`
+        : '';
+      menu.innerHTML = `
+        <div class="ctx-item" data-ctxid="ctx-open"><span class="ctx-icon">→</span><span class="ctx-label">打开</span></div>
+        <div class="ctx-item" data-ctxid="ctx-star"><span class="ctx-icon">★</span><span class="ctx-label">${starLabel}</span></div>
+        <div class="ctx-item ctx-wraps" data-ctxid="ctx-group-wrap"><span class="ctx-icon">▣</span><span class="ctx-label">加入分组</span><span class="ctx-caret">▸</span>
+          <div class="ctx-submenu">${groupItems}</div>
+        </div>
+        <div class="ctx-item" data-ctxid="ctx-group-new"><span class="ctx-icon">＋</span><span class="ctx-label">新建分组并加入</span></div>
+        ${removeItem}
+        <div class="ctx-item" data-ctxid="ctx-tags"><span class="ctx-icon">#</span><span class="ctx-label">编辑标签</span></div>
+        <div class="ctx-item" data-ctxid="ctx-rename"><span class="ctx-icon">✎</span><span class="ctx-label">重命名</span></div>
+        <div class="ctx-item ctx-danger" data-ctxid="ctx-delete"><span class="ctx-icon">✕</span><span class="ctx-label">删除</span></div>
+      `;
+      positionCtxMenu(menu, x, y);
+    }
+    function openGroupCtxAt(groupName, x, y) {
+      closeCtxMenu();
+      const g = groupsCache.find(x => x.name === groupName);
+      if (!g) return;
+      ctxGroup = groupName;
+      const menu = document.getElementById('ctx-menu');
+      menu.innerHTML = `
+        <div class="ctx-title">分组 · ${escapeHtml(groupName)}</div>
+        <div class="ctx-item" data-ctxid="ctx-group-rename"><span class="ctx-icon">✎</span><span class="ctx-label">重命名分组</span></div>
+        <div class="ctx-item ctx-danger" data-ctxid="ctx-group-disband"><span class="ctx-icon">✕</span><span class="ctx-label">解散分组</span></div>
+      `;
+      positionCtxMenu(menu, x, y);
+    }
+    function flipSubmenuIfNeeded(item) {
+      const sub = item.querySelector('.ctx-submenu');
+      if (!sub || !sub.classList.contains('open')) return;
+      const rect = sub.getBoundingClientRect();
+      if (rect.right > window.innerWidth - 8) sub.classList.add('ctx-flip-left');
+      else sub.classList.remove('ctx-flip-left');
+      const bottom = sub.getBoundingClientRect().bottom;
+      if (bottom > window.innerHeight - 8) {
+        sub.style.maxHeight = Math.max(120, window.innerHeight - bottom - 8) + 'px';
+      } else {
+        sub.style.maxHeight = '';
+      }
+    }
+    document.getElementById('ctx-menu').addEventListener('click', e => {
+      const item = e.target.closest('.ctx-item');
+      if (!item) return;
+      const subItem = item.closest('.ctx-submenu');
+      if (subItem) {
+        if (item.dataset.ctxid === 'group-add' && ctxNoteFile && item.dataset.group) {
+          const f = ctxNoteFile;
+          const g = item.dataset.group;
+          closeCtxMenu();
+          addToGroup(g, f);
+        }
+        return;
+      }
+      if (item.classList.contains('ctx-disabled')) return;
+      const wrap = item.querySelector('.ctx-submenu');
+      if (wrap) {
+        const willOpen = !wrap.classList.contains('open');
+        wrap.classList.toggle('open');
+        if (willOpen) flipSubmenuIfNeeded(item);
+        return;
+      }
+      const id = item.dataset.ctxid || '';
+      if (ctxNoteFile) {
+        const f = ctxNoteFile;
+        const n = findNote(f);
+        if (id === 'ctx-open') {
+          closeCtxMenu();
+          openNote(f);
+        } else if (id === 'ctx-star') {
+          closeCtxMenu();
+          toggleStar(f);
+        } else if (id === 'ctx-group-new') {
+          const g = groupOf(f);
+          const name = prompt((g ? '新分组名称（笔记将从原组移入新组）：' : '新分组名称：'));
+          if (!name) return;
+          closeCtxMenu();
+          createGroup(name).then(created => {
+            if (created) addToGroup(created, f);
+          });
+        } else if (id === 'group-out') {
+          const g = groupOf(f);
+          closeCtxMenu();
+          removeFromGroup(f, g);
+        } else if (id === 'ctx-tags') {
+          closeCtxMenu();
+          editTags(f);
+        } else if (id === 'ctx-rename') {
+          closeCtxMenu();
+          showRenameModal(f, !!(n && n.is_symlink), n ? (n.source_label || '') : '');
+        } else if (id === 'ctx-delete') {
+          closeCtxMenu();
+          deleteNote(f);
+        }
+        return;
+      }
+      if (ctxGroup) {
+        const g = ctxGroup;
+        if (id === 'ctx-group-rename') {
+          closeCtxMenu();
+          renameGroup(g);
+        } else if (id === 'ctx-group-disband') {
+          closeCtxMenu();
+          disbandGroup(g);
+        }
+      }
+    });
+    document.getElementById('ctx-menu').addEventListener('mouseover', e => {
+      const item = e.target.closest('.ctx-item.ctx-wraps');
+      if (!item) return;
+      if (ctxSubTimer) {
+        clearTimeout(ctxSubTimer);
+        ctxSubTimer = null;
+      }
+      const sub = item.querySelector('.ctx-submenu');
+      if (!sub.classList.contains('open')) {
+        sub.classList.add('open');
+        flipSubmenuIfNeeded(item);
+      }
+    });
+    document.getElementById('ctx-menu').addEventListener('mouseout', e => {
+      const item = e.target.closest('.ctx-item.ctx-wraps');
+      if (!item) return;
+      const related = e.relatedTarget;
+      if (related && item.contains(related)) return;
+      if (ctxSubTimer) {
+        clearTimeout(ctxSubTimer);
+        ctxSubTimer = null;
+      }
+      const wrapItem = item;
+      ctxSubTimer = setTimeout(() => {
+        const sub = wrapItem.querySelector('.ctx-submenu');
+        if (sub) sub.classList.remove('open');
+        ctxSubTimer = null;
+      }, 400);
+    });
+    document.addEventListener('contextmenu', e => {
+      const noteEl = e.target && e.target.closest ? e.target.closest('div.note[data-file]') : null;
+      if (noteEl) {
+        e.preventDefault();
+        openNoteCtxAt(noteEl.dataset.file, e.clientX, e.clientY);
+        return;
+      }
+      const ghEl = e.target && e.target.closest ? e.target.closest('div.group-header[data-group]') : null;
+      if (ghEl) {
+        e.preventDefault();
+        openGroupCtxAt(ghEl.dataset.group, e.clientX, e.clientY);
+        return;
+      }
+      closeCtxMenu();
+    });
+    document.addEventListener('mousedown', e => {
+      const menu = document.getElementById('ctx-menu');
+      const inside = e.target && e.target.closest ? e.target.closest('#ctx-menu') : null;
+      if (menu.style.display === 'block' && !inside) {
+        closeCtxMenu();
+      }
+    }, true);
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') closeCtxMenu();
+    });
+    window.addEventListener('scroll', () => closeCtxMenu(), true);
+    window.addEventListener('resize', () => closeCtxMenu());
+    let longPressTimer = null;
+    let ctxOpenedAt = 0;
+    function cancelLongPress() {
+      if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+    }
+    document.addEventListener('touchstart', e => {
+      const target = e.target;
+      if (!target || !target.closest) return;
+      const noteEl = target.closest('div.note[data-file]');
+      const ghEl = noteEl ? null : target.closest('div.group-header[data-group]');
+      if (!noteEl && !ghEl) return;
+      const touch = e.touches && e.touches[0];
+      if (!touch) return;
+      const x = touch.clientX;
+      const y = touch.clientY;
+      longPressTimer = setTimeout(() => {
+        longPressTimer = null;
+        ctxOpenedAt = Date.now();
+        if (noteEl) openNoteCtxAt(noteEl.dataset.file, x, y);
+        else openGroupCtxAt(ghEl.dataset.group, x, y);
+        if (navigator.vibrate) navigator.vibrate(10);
+      }, 500);
+    }, {passive: true});
+    document.addEventListener('touchmove', cancelLongPress, {passive: true});
+    document.addEventListener('touchend', cancelLongPress, {passive: true});
+    document.addEventListener('touchcancel', cancelLongPress, {passive: true});
     loadList();
     setInterval(() => {
       if (!userInteracting) {
@@ -4322,7 +5809,8 @@ HTML = """<!DOCTYPE html>
     document.getElementById('sync-status').textContent = '上次同步: 页面加载时';
 
     document.getElementById('note-list').addEventListener('click', e => {
-      const btn = e.target.closest('button[data-action]');
+      if (document.getElementById('ctx-menu').style.display === 'block' && Date.now() - ctxOpenedAt < 600) return;
+      const btn = e.target.closest('[data-action]');
       if (btn) {
         const action = btn.dataset.action;
         const file = btn.dataset.file;
@@ -4334,7 +5822,7 @@ HTML = """<!DOCTYPE html>
         else if (action === 'deleteNote') deleteNote(file);
         else if (action === 'renameGroup') renameGroup(btn.dataset.group);
         else if (action === 'disbandGroup') disbandGroup(btn.dataset.group);
-        else if (action === 'removeFromGroup') removeFromGroup(btn.dataset.file);
+        else if (action === 'removeFromGroup') removeFromGroup(btn.dataset.file, btn.dataset.group);
         else if (action === 'addToGroup') {
           const groupName = prompt('请输入分组名称：');
           if (groupName) addToGroup(groupName, btn.dataset.file);
@@ -4342,6 +5830,13 @@ HTML = """<!DOCTYPE html>
         else if (action === 'createGroup') {
           const name = prompt('新建分组名称：');
           if (name) createGroup(name);
+        }
+        else if (action === 'noteMore') {
+          const rect = btn.getBoundingClientRect();
+          openNoteCtxAt(file, Math.min(rect.right, window.innerWidth - 8), Math.min(rect.bottom + 4, window.innerHeight - 8));
+        }
+        else if (action === 'jumpGroup' && btn.dataset.group) {
+          jumpToGroup(btn.dataset.group);
         }
         return;
       }
@@ -4430,6 +5925,14 @@ HTML = """<!DOCTYPE html>
       if (editBtn) {
         const file = document.getElementById('reader').dataset.file || '';
         if (file) openEditor(file);
+      }
+      const modeBtn = e.target.closest('[data-reader-mode]');
+      if (modeBtn) {
+        setReaderMode(modeBtn.dataset.readerMode);
+      }
+      const wordSaveBtn = e.target.closest('[data-action="wordSave"]');
+      if (wordSaveBtn) {
+        saveWord();
       }
     });
 

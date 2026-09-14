@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-09-14
+
+### Added
+
+- 四种列表视图统一支持右键菜单、长按菜单、拖拽、批量选择和分组管理
+- 分组胶囊跳转、组头重命名/解散，以及平铺和分组视图间拖入/移出分组
+- 阅读、Word、Markdown 三态工作流；Word 富文本工具栏支持标题、格式、链接、引用、代码、列表、任务、表格和图片
+- Word DOM 到 Markdown 序列化，覆盖嵌套块、连续代码空行、动态代码围栏、任务状态和转义表格管道符
+- Word 图片上传、资源回显和 Markdown 路径往返保存
+
+### Fixed
+
+- Word 与 Markdown 模式切换后的内容刷新、未保存状态、并发保存和冲突恢复
+- 备注保存改为笔记索引字段，不再生成伪自定义视图
+
+### Security
+
+- Word 粘贴和图片 URL 延续白名单与危险节点过滤；本地资源路径继续经受限 asset 接口提供
+
 ## [0.4.0] - 2026-09-13
 
 ### Added

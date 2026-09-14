@@ -511,6 +511,45 @@ class TestMarkdownRenderer(unittest.TestCase):
     def test_escape_html(self):
         self.assertEqual(escape_html("<script>"), "&lt;script&gt;")
 
+    def test_simple_markdown_task_checkbox_stays_disabled(self):
+        html = simple_markdown(
+            "- [x] done\n"
+            "- [ ] todo\n"
+        )
+        self.assertIn('type="checkbox" disabled checked', html)
+        self.assertIn('type="checkbox" disabled', html)
+        self.assertIn('class="task"', html)
+
+    def test_split_table_row_plain_unchanged(self):
+        from noted.hub import _split_table_row
+        self.assertEqual(_split_table_row("| a | b | c |"), ["a", "b", "c"])
+        self.assertEqual(_split_table_row("| --- | :---: |"), ["---", ":---:"])
+        self.assertEqual(_split_table_row("| x|y | z |"), ["x", "y", "z"])
+
+    def test_split_table_row_escaped_pipe(self):
+        from noted.hub import _split_table_row
+        self.assertEqual(_split_table_row("| a\\|b | c |"), ["a|b", "c"])
+        self.assertEqual(_split_table_row("| x\\|y\\|z | w |"), ["x|y|z", "w"])
+        self.assertEqual(_split_table_row("| a\\\\ | b |"), ["a\\\\", "b"])
+
+    def test_simple_markdown_table_escaped_pipe_roundtrip(self):
+        cell = "p|q|r"
+        md = (
+            "| name\\|val | a |\n"
+            "| --- | --- |\n"
+            "| " + cell.replace("|", "\\|") + " | 1 |\n"
+        )
+        html = simple_markdown(md)
+        self.assertIn("<th>name|val</th>", html)
+        self.assertIn("<td>" + cell + "</td>", html)
+
+    def test_simple_markdown_table_plain_roundtrip(self):
+        md = "| h1 | h2 |\n| --- | --- |\n| a | b |\n"
+        html = simple_markdown(md)
+        self.assertIn("<th>h1</th>", html)
+        self.assertIn("<td>a</td>", html)
+        self.assertIn("<td>b</td>", html)
+
 
 class TestSecurityHeadersMethod(unittest.TestCase):
     def test_security_headers_method_exists(self):
@@ -2383,6 +2422,120 @@ class TestGroups(_HTTPServerFixture):
         self.assertFalse(data["ok"])
 
 
+class TestGroupBarAndCtxMenuDataFlow(_HTTPServerFixture):
+    def _post_json(self, path, obj):
+        payload = json.dumps(obj).encode("utf-8")
+        return self._request(
+            path,
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+
+    def _seed_notes(self, *names):
+        for name in names:
+            with open(os.path.join(self.tmpdir, f"{name}.md"), "w", encoding="utf-8") as f:
+                f.write(f"# {name}\n\ntags: a\n\nbody")
+
+    def test_groups_endpoint_structure_for_bar(self):
+        self._seed_notes("a", "b")
+        self._start_server()
+        self._post_json("/api/group/create", {"name": "工作"})
+        self._post_json("/api/group/add", {"group": "工作", "file": "a.md"})
+        status, _, body = self._request("/api/groups")
+        self.assertEqual(status, 200)
+        groups = json.loads(body)
+        self.assertEqual(len(groups), 1)
+        g = groups[0]
+        self.assertEqual(g["name"], "工作")
+        self.assertEqual(g["files"], ["a.md"])
+        self.assertEqual(g["count"], 1)
+        self.assertFalse(g["collapsed"])
+        for key in ("name", "files", "collapsed", "count"):
+            self.assertIn(key, g)
+        status, _, body = self._request("/api/list")
+        self.assertEqual(status, 200)
+        notes = json.loads(body)
+        by_file = {n["file"]: n for n in notes}
+        self.assertEqual(by_file["a.md"]["group"], "工作")
+        self.assertEqual(by_file["b.md"]["group"], "")
+
+    def test_group_count_updates_after_file_delete(self):
+        self._seed_notes("a")
+        self._start_server()
+        self._post_json("/api/group/create", {"name": "工作"})
+        self._post_json("/api/group/add", {"group": "工作", "file": "a.md"})
+        status, _, body = self._request("/api/groups")
+        self.assertEqual(json.loads(body)[0]["count"], 1)
+        status, _, body = self._post_json("/api/delete", {"file": "a.md"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        status, _, body = self._request("/api/groups")
+        self.assertEqual(status, 200)
+        groups = json.loads(body)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["name"], "工作")
+        self.assertEqual(groups[0]["files"], [])
+        self.assertEqual(groups[0]["count"], 0)
+
+    def test_group_removal_with_explicit_group_moves_between_groups(self):
+        self._seed_notes("a")
+        self._start_server()
+        self._post_json("/api/group/create", {"name": "旧组"})
+        self._post_json("/api/group/create", {"name": "新组"})
+        self._post_json("/api/group/add", {"group": "旧组", "file": "a.md"})
+        status, _, body = self._post_json("/api/group/add", {"group": "新组", "file": "a.md"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        status, _, body = self._request("/api/groups")
+        by_name = {g["name"]: g for g in json.loads(body)}
+        self.assertEqual(by_name["新组"]["files"], ["a.md"])
+        self.assertEqual(by_name["旧组"]["files"], [])
+        status, _, body = self._post_json("/api/group/remove", {"group": "新组", "file": "a.md"})
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        status, _, body = self._request("/api/groups")
+        by_name = {g["name"]: g for g in json.loads(body)}
+        self.assertEqual(by_name["新组"]["files"], [])
+        self.assertEqual(by_name["旧组"]["files"], [])
+
+    def test_groups_visible_while_search_active(self):
+        self._seed_notes("alpha", "beta")
+        self._start_server()
+        self._post_json("/api/group/create", {"name": "工作"})
+        self._post_json("/api/group/add", {"group": "工作", "file": "alpha.md"})
+        status, _, body = self._request("/api/search?q=gamma")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), [])
+        status, _, body = self._request("/api/groups")
+        self.assertEqual(status, 200)
+        groups = json.loads(body)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["name"], "工作")
+        self.assertEqual(groups[0]["count"], 1)
+        self.assertEqual(groups[0]["files"], ["alpha.md"])
+
+    def test_html_serves_group_bar_ctx_menu_and_unified_card(self):
+        self._seed_notes("a")
+        self._start_server()
+        status, _, body = self._request("/")
+        self.assertEqual(status, 200)
+        self.assertIn('class="group-bar"', body)
+        self.assertIn('class="group-capsule"', body)
+        self.assertIn('class="group-capsule-new" data-action="createGroup"', body)
+        self.assertIn('class="ctx-menu" id="ctx-menu"', body)
+        self.assertIn('data-action="noteMore"', body)
+        self.assertIn('data-action="removeFromGroup"', body)
+        self.assertIn("addEventListener('contextmenu'", body)
+        self.assertIn('draggable="true"', body)
+        self.assertNotIn("onclick=", body)
+
+
 class TestEditorAPI(_HTTPServerFixture):
     PNG_1PX = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChAGGA4KrCQAAAABJRU5ErkJggg=="
 
@@ -2873,6 +3026,354 @@ class TestPOSTBodyHardening(_HTTPServerFixture):
             data=raw,
         )
         self.assertEqual(status, 400)
+
+
+class TestWordModeStatic(unittest.TestCase):
+    def setUp(self):
+        from noted.hub import HTML
+        self.html = HTML
+
+    def test_word_serialize_to_markdown_present(self):
+        self.assertIn("wordSerializeToMarkdown", self.html)
+
+    def test_word_save_function_present(self):
+        self.assertIn("saveWord", self.html)
+        self.assertIn("wordConflictRevision", self.html)
+
+    def test_word_save_state_element_present(self):
+        self.assertIn('id="word-save-state"', self.html)
+
+    def test_no_word_placeholder_log(self):
+        self.assertNotIn("保存占位", self.html)
+
+    def test_beforeunload_guards_word_dirty(self):
+        self.assertIn("window.addEventListener('beforeunload'", self.html)
+        self.assertIn("wordState.dirty", self.html)
+
+    def test_word_save_builds_revision_body(self):
+        self.assertIn("wordConflictRevision || wordState.revision", self.html)
+
+    def test_word_save_posts_to_save_endpoint(self):
+        self.assertIn("'/api/save'", self.html)
+
+    def test_word_symlink_confirm_prompt_present(self):
+        self.assertIn("确认写入源文件", self.html)
+
+    def test_word_conflict_modal_present(self):
+        self.assertIn("保存冲突", self.html)
+
+    def test_word_mark_dirty_present(self):
+        self.assertIn("wordMarkDirty", self.html)
+
+
+    def test_word_paragraph_newlines_preserved(self):
+        self.assertIn("wordSplitBlockText", self.html)
+        self.assertIn("lines.push.apply(lines, wordSplitBlockText(buf))", self.html)
+
+    def test_word_quote_splines(self):
+        self.assertIn("const qparts = wordSplitBlockText(wordSerializeInline(c));", self.html)
+
+    def test_word_no_global_blank_compression(self):
+        self.assertNotIn("/\\n{3,}/g", self.html)
+
+    def test_word_container_blocks_recurse(self):
+        self.assertIn("const WORD_CONTAINER_TAGS = { div: 1, section: 1, article: 1, main: 1", self.html)
+        self.assertIn("if (WORD_CONTAINER_TAGS[tag]) {", self.html)
+
+    def test_word_paper_checkboxes_interactive(self):
+        self.assertIn("querySelectorAll('input[type=checkbox]')", self.html)
+        self.assertIn("boxes[i].removeAttribute('disabled');", self.html)
+        self.assertIn("boxes[i].setAttribute('contenteditable', 'false');", self.html)
+
+    def test_word_paper_change_delegates_checkbox_dirty(self):
+        self.assertIn("word-paper').addEventListener('change'", self.html)
+        self.assertIn(
+            "String(t.type).toLowerCase() === 'checkbox') {",
+            self.html,
+        )
+
+    def test_word_paste_sanitizes_checkbox(self):
+        self.assertIn("el.setAttribute('contenteditable', 'false');", self.html)
+        self.assertIn("el.checked = !!node.checked;", self.html)
+
+    def test_word_html_paste_plain_text_fallback(self):
+        self.assertIn("wordPasteHtml(html, cd.getData('text/plain'))", self.html)
+        self.assertIn("document.execCommand('insertText', false, plainText)", self.html)
+
+    def test_word_cell_newlines_become_spaces(self):
+        self.assertNotIn("replace(/\\n/g, '<br>')", self.html)
+        self.assertIn("t = t.replace(/\\n/g, ' ');", self.html)
+
+    def test_word_inline_code_fence_escapes_backticks(self):
+        self.assertIn("Math.max(1, wordMaxBacktickRun(t) + 1)", self.html)
+
+    def test_word_save_in_flight_guard(self):
+        self.assertIn("wordSaveInFlight", self.html)
+        self.assertIn("if (wordSaveInFlight) return;", self.html)
+        self.assertIn("wordSaveInFlight = false", self.html)
+
+    def test_word_mode_entry_always_reloads(self):
+        self.assertNotIn("wordState.file !== file", self.html)
+
+    def test_editor_back_reader_button(self):
+        self.assertIn('data-edit="back-reader"', self.html)
+        self.assertIn("else if (action === 'back-reader') backToReader();", self.html)
+
+    def test_word_task_serializes_checked_state(self):
+        self.assertIn("checkbox.checked === true ? '- [x] ' : '- [ ] '", self.html)
+
+    def test_word_pre_kept_intact_in_paragraphs(self):
+        self.assertIn("const pl = wordPreLines(c);", self.html)
+
+
+class TestNotePersistence(_HTTPServerFixture):
+    def test_save_note_returns_in_list_and_no_fake_view(self):
+        with open(os.path.join(self.tmpdir, "note.md"), "w", encoding="utf-8") as f:
+            f.write("# Note\n\ntags: a\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "note.md", "tags": ["a"], "note": "my remark"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/tags",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data.get("ok"))
+        status, _, body = self._request("/api/list")
+        self.assertEqual(status, 200)
+        notes = json.loads(body)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["note"], "my remark")
+        status, _, body = self._request("/api/views")
+        self.assertEqual(status, 200)
+        views = json.loads(body)
+        self.assertNotIn("_note_note.md", views)
+
+    def test_save_note_without_note_field_clears_existing(self):
+        index = {"note.md": {"tags": ["a"], "note": "old remark"}}
+        with open(os.path.join(self.tmpdir, ".index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+        with open(os.path.join(self.tmpdir, "note.md"), "w", encoding="utf-8") as f:
+            f.write("# Note\n\ntags: a\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "note.md", "tags": ["a"], "note": None}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/tags",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        status, _, body = self._request("/api/list")
+        notes = json.loads(body)
+        self.assertEqual(notes[0]["note"], "")
+
+    def test_save_note_long_text_truncated(self):
+        with open(os.path.join(self.tmpdir, "note.md"), "w", encoding="utf-8") as f:
+            f.write("# Note\n\ntags: a\n\nbody")
+        self._start_server()
+        long_note = "x" * 600
+        payload = json.dumps({"file": "note.md", "tags": ["a"], "note": long_note}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/tags",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        status, _, body = self._request("/api/list")
+        notes = json.loads(body)
+        self.assertEqual(len(notes[0]["note"]), 500)
+
+    def test_tag_update_without_note_preserves_existing_note(self):
+        index = {"note.md": {"tags": ["a"], "note": "keep me"}}
+        with open(os.path.join(self.tmpdir, ".index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+        with open(os.path.join(self.tmpdir, "note.md"), "w", encoding="utf-8") as f:
+            f.write("# Note\n\ntags: a\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "note.md", "tags": ["b"]}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/tags",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["ok"])
+        status, _, body = self._request("/api/list")
+        notes = json.loads(body)
+        self.assertEqual(notes[0]["tags"], ["b"])
+        self.assertEqual(notes[0]["note"], "keep me")
+
+    def test_save_note_rejects_non_string(self):
+        with open(os.path.join(self.tmpdir, "note.md"), "w", encoding="utf-8") as f:
+            f.write("# Note\n\ntags: a\n\nbody")
+        self._start_server()
+        payload = json.dumps({"file": "note.md", "tags": ["a"], "note": ["bad"]}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/tags",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        result = json.loads(body)
+        self.assertFalse(result["ok"])
+        self.assertIn("备注必须为字符串", result["error"])
+
+    def test_fake_note_views_are_hidden(self):
+        index = {
+            "_view__note_note.md": {
+                "name": "_note_note.md",
+                "view": True,
+                "filters": {"note": "old remark"},
+            },
+        }
+        with open(os.path.join(self.tmpdir, ".index.json"), "w", encoding="utf-8") as f:
+            json.dump(index, f)
+        self._start_server()
+        status, _, body = self._request("/api/views")
+        self.assertEqual(status, 200)
+        self.assertNotIn("_note_note.md", json.loads(body))
+
+
+class TestWordImageRoundtripStatic(unittest.TestCase):
+    def test_html_asset_url_reversible_to_markdown_path(self):
+        from noted.hub import simple_markdown
+        md = "![alt](note/abc.png)"
+        html = simple_markdown(md)
+        self.assertIn('src="/api/asset?file=', html)
+        self.assertIn('alt="alt"', html)
+        import re
+        m = re.search(r'src="([^"]+)"', html)
+        self.assertIsNotNone(m)
+        asset_src = m.group(1)
+        expected = "/api/asset?file=" + urllib.parse.quote("note/abc.png", safe="/")
+        self.assertEqual(asset_src, expected)
+        node = type("N", (), {"getAttribute": lambda self, name: asset_src if name == "src" else ("alt text" if name == "alt" else "")})()
+        self.assertEqual(self._word_image_md(node), '![alt text](note/abc.png)')
+
+    def test_word_image_keeps_safe_external_urls(self):
+        from noted.hub import HTML
+        self.assertIn("function wordSafeMarkdownImageUrl(raw)", HTML)
+        self.assertIn("if (!wordSafeMarkdownImageUrl(src)) return '';", HTML)
+        self.assertIn("const safe = wordSafeUrl(src);", HTML)
+        self.assertIn("if (!safe) return '';", HTML)
+        self.assertIn("src = safe;", HTML)
+        self.assertIn("src = '/api/asset?file=' + encodeURIComponent(src);", HTML)
+
+    def test_word_safe_url_present_and_allows_expected_schemes(self):
+        from noted.hub import HTML
+        self.assertIn("function wordSafeUrl(raw)", HTML)
+        self.assertIn("lower.indexOf('http://') === 0", HTML)
+        self.assertIn("lower.indexOf('https://') === 0", HTML)
+        self.assertIn("lower.indexOf('mailto:') === 0", HTML)
+        self.assertIn("s.charAt(0) === '/' && s.charAt(1) !== '/'", HTML)
+
+    @staticmethod
+    def _word_image_md(node):
+        src = node.getAttribute('src')
+        if not src:
+            return ''
+        src = str(src).strip()
+        asset_prefix = '/api/asset?file='
+        if src.startswith(asset_prefix):
+            try:
+                src = urllib.parse.unquote(src[len(asset_prefix):])
+            except Exception:
+                return ''
+        if '..' in src or src.startswith('/') or src.startswith('//'):
+            return ''
+        import re as re_mod
+        if not re_mod.match(r'^[a-zA-Z0-9_\-./]+$', src):
+            return ''
+        alt = str(node.getAttribute('alt') or '').strip()
+        alt = alt.replace('\n', ' ').replace('\r', ' ').replace('[', '').replace(']', '').replace('"', '').strip()
+        return f'![{alt}]({src})'
+
+
+class TestUploadAPIRegression(_HTTPServerFixture):
+    def test_upload_returns_ok_and_url(self):
+        with open(os.path.join(self.tmpdir, "note.md"), "w", encoding="utf-8") as f:
+            f.write("# Note\n\ntags: a\n\nbody")
+        self._start_server()
+        png_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82").decode()
+        payload = json.dumps({"file": "note.md", "data": png_b64, "mime": "image/png", "filename": "x.png"}).encode("utf-8")
+        status, _, body = self._request(
+            "/api/upload",
+            method="POST",
+            headers={
+                "Host": f"localhost:{self.port}",
+                "Origin": f"http://localhost:{self.port}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(payload)),
+            },
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data.get("ok"))
+        self.assertIn("/", data.get("url", ""))
+
+    def test_uploaded_image_served_via_asset(self):
+        with open(os.path.join(self.tmpdir, "note.md"), "w", encoding="utf-8") as f:
+            f.write("# Note\n\ntags: a\n\nbody")
+        self._start_server()
+        png_b64 = base64.b64encode(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82").decode()
+        payload = json.dumps({"file": "note.md", "data": png_b64, "mime": "image/png", "filename": "x.png"}).encode("utf-8")
+        upload_headers = {
+            "Host": f"localhost:{self.port}",
+            "Origin": f"http://localhost:{self.port}",
+            "Content-Type": "application/json",
+            "Content-Length": str(len(payload)),
+        }
+        status, _, body = self._request(
+            "/api/upload",
+            method="POST",
+            headers=upload_headers,
+            data=payload,
+        )
+        self.assertEqual(status, 200)
+        upload_data = json.loads(body)
+        self.assertTrue(upload_data.get("ok"))
+        asset_path = upload_data["url"]
+        asset_headers = {
+            "Host": f"localhost:{self.port}",
+            "Origin": f"http://localhost:{self.port}",
+        }
+        asset_url = f"/api/asset?file={asset_path}"
+        status, headers, raw = self._request_bytes(asset_url)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), "image/png")
+        self.assertEqual(raw[:4], b"\x89PNG")
 
 
 if __name__ == "__main__":

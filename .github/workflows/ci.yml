@@ -23,6 +23,9 @@ jobs:
           python -m py_compile src/noted/hub.py
           python -m py_compile src/noted/cli.py
           python -m py_compile tests/test_hub.py
+      - name: Verify embedded JavaScript
+        run: |
+          PYTHONPATH=src python -W error::SyntaxWarning -c 'from noted.hub import HTML; start = HTML.index("<script>") + len("<script>"); end = HTML.index("</script>", start); print(HTML[start:end], end="")' | node --check
       - name: Verify no hardcoded user paths in source
         run: |
           if grep -rInE "(/Users/[^/]+/|/home/[^/]+/|C:\\\\Users\\\\)" src/ tests/ README.md; then

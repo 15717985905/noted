@@ -8,15 +8,16 @@
 
 - 阅读：浏览器端 Markdown 渲染，支持代码块、列表、引用
 - 重命名：网页端重命名文件，可选联动更新正文 H1 标题、同步重命名源文件（软链接）
+- 三态编辑：阅读、Word 富文本、Markdown 原文可切换；Word 支持格式、链接、引用、代码、列表、任务、表格、图片和 Markdown 往返保存
 - Markdown 编辑：网页端编辑原文，双栏实时预览，支持表格、代码、任务列表、图片、快捷键和冲突保护
-- 分组折叠：虚拟分组管理，支持拖拽建组/拖入组/批量勾选加入，组可折叠、重命名、解散（访达式交互，不动真实文件）
+- 分组折叠：虚拟分组管理，支持右键/长按、拖拽建组/拖入组/批量勾选加入，组可折叠、重命名、解散（访达式交互，不动真实文件）
 - 文件定位：阅读页查看文件路径、在 Finder 中显示、用编辑器打开
 - 搜索：全文搜索标题、标签、正文
 - 标签：读取 markdown 头部 `标签:` 行，支持网页端增删改
 - 星标：标记重要总结
 - 视图：保存自定义筛选视图（搜索 + 标签组合）
 - 收藏区：独立收藏列表，快速访问
-- 三种视图：平铺（按时间排序）、按来源分组、按标签分组
+- 四种视图：平铺（按时间排序）、按来源分组、按标签分组、虚拟分组
 - 相关笔记：阅读页推荐同标签/同来源笔记
 - 移动端抽屉：侧栏抽屉导航，适配小屏
 - 发现与同步：扫描 agent 会话目录和自定义同步目录，自动入库
@@ -134,8 +135,8 @@ python -W error::ResourceWarning -m unittest discover tests -v
 # 语法检查
 python -m py_compile src/noted/hub.py src/noted/cli.py
 
-# JS 语法检查（提取 HTML 内嵌 JS）
-node --check <(sed -n '/<script>/,/<\/script>/p' src/noted/hub.py | sed 's/<script>//g; s/<\/script>//g')
+# JS 语法检查（提取运行时 HTML 内嵌 JS）
+PYTHONPATH=src python -W error::SyntaxWarning -c 'from noted.hub import HTML; start = HTML.index("<script>") + len("<script>"); end = HTML.index("</script>", start); print(HTML[start:end], end="")' | node --check
 
 # 冒烟测试
 bash scripts/smoke.sh
@@ -179,9 +180,13 @@ pkill -f "python3 -m noted.hub"
 - **rename 联动**：重命名文件时，分组记录自动迁移（旧名→新名）
 - **delete 联动**：删除文件时，自动从所有分组中移除；空组保留（需手动解散）
 
+## Word 编辑
+
+阅读页支持「阅读 / Word / Markdown」三态切换。Word 使用本地富文本编辑器，支持标题、粗斜体、行内代码、链接、引用、代码块、列表、任务列表、表格和图片；保存时会转换为 Markdown。图片仍保存到当前笔记的本地资源目录，重新打开 Word 或切换 Markdown 后保持同一资源引用。支持 Cmd/Ctrl+S、未保存提醒、revision 冲突处理和软链接源文件确认。
+
 ## Markdown 编辑
 
-在阅读页点击「编辑」进入工作台。桌面端为 Markdown 原文与安全预览双栏布局，移动端可切换「编辑/预览」。工具栏可插入标题、强调、链接、引用、代码块、列表、任务列表、表格和图片；普通文本或 AI 生成的 Markdown 粘贴会保留原文，剪贴板图片会保存到当前笔记的本地资源目录并自动插入引用。支持 Cmd/Ctrl+S 保存。
+在阅读页切换到「Markdown」进入工作台。桌面端为 Markdown 原文与安全预览双栏布局，移动端可切换「编辑/预览」。工具栏可插入标题、强调、链接、引用、代码块、列表、任务列表、表格和图片；普通文本或 AI 生成的 Markdown 粘贴会保留原文，剪贴板图片会保存到当前笔记的本地资源目录并自动插入引用。支持 Cmd/Ctrl+S 保存。
 
 保存使用 revision 乐观并发保护：文件被其他程序修改时不会覆盖，需重新加载或明确选择覆盖。软链接笔记默认不写源文件，只有明确确认后才同步修改源文件；图片和 Markdown 资源仅保存在本机笔记目录，不上传外部服务。
 
